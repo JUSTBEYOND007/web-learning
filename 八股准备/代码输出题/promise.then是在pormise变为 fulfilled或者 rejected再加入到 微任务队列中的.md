@@ -1,0 +1,1 @@
+promise.then是在pormise变为 fulfilled或者 rejected再加入到 微任务队列中的

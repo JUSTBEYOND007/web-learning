@@ -1,0 +1,1 @@
+在配置方面，我主要在 vite.config.js 中做过几项配置，比如设置路径别名 @ 指向 src 目录、通过 server.proxy 配置接口代理解决开发环境跨域问题，以及在 build 中配置 rollupOptions 进行代码拆分来优化打包体积

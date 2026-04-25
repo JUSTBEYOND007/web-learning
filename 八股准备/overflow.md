@@ -1,0 +1,1 @@
+overflow 用于控制内容溢出容器时的处理方式，常见取值有 visible、hidden、scroll、auto 和 clip。visible 是默认值，表示内容溢出仍然显示；hidden 会隐藏溢出内容；scroll 会始终显示滚动条；auto 只有在内容溢出时才会出现滚动条；clip 是较新的属性，会裁剪内容且不允许滚动。

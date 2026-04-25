@@ -1,0 +1,1 @@
+Promise 是为了解决 JavaScript 中异步操作的回调地狱问题
