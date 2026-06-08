@@ -1,0 +1,38 @@
+先讲：CORS 是什么？
+
+CORS = 跨域资源共享全称：Cross-Origin Resource Sharing
+大白话：浏览器有安全限制（同源策略），不允许前端直接请求别的域名接口；
+CORS 就是后端开 “通行证”，告诉浏览器：这个请求我允许，别拦着！
+一句话总结：CORS 是后端解决跨域的标准方案，前端啥也不用干，全靠后端配置响应头。
+你问的那 4 个响应头，逐句翻译（超级易懂版）
+
+1. Access-Control-Allow-Origin: *
+
+意思：我允许任何域名来请求我
+* 就是所有人都能访问
+也可以写具体域名，比如 https://www.bilibili.com
+作用：解决最基础的跨域报错
+2. Access-Control-Allow-Methods: GET,POST,PUT,DELETE
+
+意思：我允许你用这些请求方式来调用我
+告诉浏览器：GET、POST、PUT、DELETE 我都允许
+不配置的话，浏览器会阻止 PUT/DELETE 等非简单请求
+3. Access-Control-Allow-Headers: content-type
+
+意思：我允许你携带这些请求头
+比如前端传 Content-Type: application/json
+后端必须允许，否则浏览器拦截
+4. Access-Control-Allow-Credentials: true
+
+意思：我允许你携带 cookie 等身份信息
+重点：
+设为 true 时，Allow-Origin ** 不能用 ***，必须写具体域名
+登录态、cookie、session 跨域必须开这个
+最精简面试背诵版（背这个就够）
+
+CORS 是后端通过设置 HTTP 响应头，告诉浏览器允许跨域请求的标准方案。
+必须配置 4 个核心头：
+Access-Control-Allow-Origin：允许哪些域名访问
+Access-Control-Allow-Methods：允许哪些请求方法
+Access-Control-Allow-Headers：允许哪些请求头
+Access-Control-Allow-Credentials：是否允许携带 cookie
