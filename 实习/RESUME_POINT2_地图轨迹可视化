@@ -1,0 +1,969 @@
+# 简历第二点：地图轨迹可视化 — 代码巩固手册
+
+  
+
+> 对应简历描述：接入高德地图 AMap SDK，将接口坐标转为 WKT 格式推送地图组件，实现规划路径（蓝）与历史路径（灰）双轨迹叠加渲染；监听数据变更执行 `clearMap → renderOverlays → setFitView` 自适应重绘。
+
+>
+
+> 核心文件：
+
+> - `src/pages/UnmannedVehicleNew/components/DeliveryMap/index.tsx`（地图渲染组件）
+
+> - `src/pages/UnmannedVehicleNew/components/DeliveryMap/useMapInitialize.ts`（SDK 初始化）
+
+> - `src/pages/UnmannedVehicleNew/components/DeliveryMap/utils.tsx`（覆盖物样式配置）
+
+> - `src/pages/UnmannedVehicleNew/components/DeliveryMap/CarMarker.tsx`（车辆气泡组件）
+
+> - `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/index.tsx`（轨迹数据组装）
+
+  
+
+---
+
+  
+
+## 一、整体架构：数据流向
+
+  
+
+```
+
+接口返回坐标数组（lng/lat[]）
+
+↓
+
+WKT 格式转换（父页面）
+
+"LINESTRING(lng lat, lng lat, ...)"
+
+"POINT(lng lat)"
+
+↓
+
+TrajectoryInfo[] 传入 DeliveryMap 组件
+
+↓
+
+trajectoryInfo 变化触发 useEffect
+
+↓
+
+clearMap() → addOverlayConfig() → renderOverlays() → setFitView()
+
+↓
+
+高德地图画出路线 + 站点标记 + 车辆标记
+
+```
+
+  
+
+**关键设计原则**：父页面负责"把坐标翻译成 WKT"，`DeliveryMap` 组件只负责"把 WKT 画到地图上"，职责分离。
+
+  
+
+---
+
+  
+
+## 二、WKT 格式：接口坐标 → 地图可用格式
+
+  
+
+### 2.1 什么是 WKT？
+
+  
+
+WKT（Well-Known Text）是一种用文本描述几何对象的标准格式，高德地图内部的 `wktToOverlay` 工具函数可以直接解析。
+
+  
+
+```
+
+点（站点位置、车辆位置）：
+
+POINT(经度 纬度)
+
+示例：POINT(120.153576 30.287459)
+
+  
+
+线（路线轨迹）：
+
+LINESTRING(经度1 纬度1, 经度2 纬度2, ...)
+
+示例：LINESTRING(120.15 30.28, 120.16 30.29, 120.17 30.31)
+
+```
+
+  
+
+> **注意**：WKT 格式是 "经度 纬度"（lng lat），不是"纬度 经度"。
+
+  
+
+### 2.2 车辆详情页：坐标 → WKT 组装
+
+  
+
+```typescript
+
+// DetailMap/index.tsx:459 — getTransportDetail 内部
+
+const routes = [];
+
+transportAutoports.forEach(item => {
+
+// 规划路径（蓝色）：status = 0 = NotPassed
+
+if (item?.planPath) {
+
+routes.push({
+
+path: `LINESTRING(${item.planPath.map(s => `${s.lng} ${s.lat}`).join(',')})`,
+
+status: 0
+
+});
+
+}
+
+// 历史已走路径（灰色）：status = 1 = Passed
+
+if (item?.historyPath) {
+
+routes.push({
+
+path: `LINESTRING(${item.historyPath.map(s => `${s.lng} ${s.lat}`).join(',')})`,
+
+status: 1
+
+});
+
+}
+
+});
+
+  
+
+// 站点位置：POINT 格式
+
+const staPoints = transportAutoports.map(item => ({
+
+staId: item?.utpAutoportId,
+
+eta: item?.estimateArriveTime ? `${match[1]}:${match[2]}预计到达` : '',
+
+wkt: `POINT(${item.utpAutoportLoc.lng} ${item.utpAutoportLoc.lat})`,
+
+status: 0,
+
+type: "POST_POINT"
+
+}));
+
+  
+
+// 终点
+
+const endPoint = {
+
+wkt: `POINT(${lastStation.utpAutoportLoc.lng} ${lastStation.utpAutoportLoc.lat})`
+
+};
+
+  
+
+// 组装成 TrajectoryInfo[] 传给 DeliveryMap
+
+setTrackInfo([{ staPoints, endPoint, routes }]);
+
+```
+
+  
+
+### 2.3 发车任务页：路线规划结果 → WKT
+
+  
+
+```typescript
+
+// CreateRecordMap/index.tsx:400 — getTrajectoryInfo 回调
+
+const routes = utpAutoportPlans
+
+.filter(item => item?.planPath?.length > 0)
+
+.map(item => ({
+
+path: `LINESTRING(${item.planPath.map(s => `${s.lng} ${s.lat}`).join(',')})`
+
+// 发车规划阶段没有历史路径，所以不加 status
+
+}));
+
+  
+
+const validStaPoints = utpAutoportPlans
+
+.filter(item => item?.utpAutoportLoc?.lng && item?.utpAutoportLoc?.lat)
+
+.map(item => ({
+
+staId: item?.utpAutoportId,
+
+eta: match ? `${match[1]}:${match[2]}预计到达` : '',
+
+wkt: `POINT(${item.utpAutoportLoc.lng} ${item.utpAutoportLoc.lat})`,
+
+status: 0,
+
+type: "POST_POINT"
+
+}));
+
+  
+
+setTrackInfo([{ staPoints: validStaPoints, startPoint, endPoint, routes }]);
+
+```
+
+  
+
+---
+
+  
+
+## 三、地图 SDK 初始化：useMapInitialize
+
+  
+
+```typescript
+
+// useMapInitialize.ts — 完整代码
+
+import AMapLoader from '@amap/amap-jsapi-loader';
+
+import { Map, initializeMap } from '@/vendors/alife-yz-map-next';
+
+  
+
+export const useMapInitialize = (id: string) => {
+
+const [mapReady, setMapReady] = useState(false);
+
+  
+
+useEffect(() => {
+
+// 动态加载高德 JS SDK（异步，避免阻塞首屏）
+
+AMapLoader.load({
+
+key: AMapConfig.key,
+
+version: AMapConfig.version,
+
+}).then(async (AMap) => {
+
+// 挂到 window 上，供 wktToOverlay 工具函数内部使用
+
+(window as any).AMap = AMap;
+
+(window as any)._amap_instance = null;
+
+  
+
+// 初始化地图实例，绑定到 id="vehicle-map" 的 DOM 节点
+
+await initializeMap(id, {
+
+zoom: 12,
+
+zooms: [4, 20], // 缩放范围
+
+mapStyle: 'amap://styles/whitesmoke', // 白烟主题（浅色）
+
+});
+
+  
+
+setMapReady(true); // 标记地图就绪，触发渲染 useEffect
+
+});
+
+  
+
+// 组件卸载时销毁地图实例，防止内存泄漏
+
+return () => {
+
+Map.destroy();
+
+};
+
+}, [id]); // id 不变则只初始化一次
+
+  
+
+return mapReady; // 外部根据此值决定何时开始渲染覆盖物
+
+};
+
+```
+
+  
+
+> **面试要点**：为什么要等 `mapReady` 之后才渲染覆盖物？
+
+> 答：`AMapLoader.load` 是异步的，在 SDK 加载完成、地图实例创建完毕之前调用 `Map.getInstance()` 会拿到 null，导致覆盖物添加失败。`mapReady` 作为守卫条件保证时序正确。
+
+  
+
+---
+
+  
+
+## 四、覆盖物样式配置：addOverlayConfig
+
+  
+
+在渲染之前调用一次，为每种覆盖物类型注册样式，后续 `wktToOverlay` 按 key 查找对应配置。
+
+  
+
+```typescript
+
+// utils.tsx:32 — addOverlayConfig
+
+export const addOverlayConfig = () => {
+
+// 公共线条配置（所有路线共享）
+
+const commonLineConfig = {
+
+strokeWeight: 6, // 线宽
+
+strokeOpacity: 1,
+
+borderWeight: 2, // 描边宽度（产生外描边效果）
+
+isOutline: true,
+
+lineCap: 'round', // 圆头
+
+lineJoin: 'round', // 圆角连接
+
+};
+
+  
+
+// 历史已走路径 status=1（RouteStatus.Passed）→ 灰色
+
+Polyline.config.addConfig('route-line-1', {
+
+strokeColor: '#C0C0C0', // 浅灰
+
+outlineColor: '#808080', // 深灰描边
+
+zIndex: 100,
+
+...commonLineConfig,
+
+});
+
+  
+
+// 规划路径-派送 status=0（RouteStatus.NotPassed_POST）→ 蓝色
+
+Polyline.config.addConfig('route-line-0', {
+
+strokeColor: '#82B1FF', // 蓝色
+
+outlineColor: '#2B67ED', // 深蓝描边
+
+zIndex: 99,
+
+...commonLineConfig,
+
+});
+
+  
+
+// 规划路径-揽收（RouteStatus.NotPassed_PICK）→ 青绿色
+
+Polyline.config.addConfig('route-line-2', {
+
+strokeColor: '#D6FCF5', // 浅青
+
+outlineColor: '#0DA48A', // 深青描边
+
+zIndex: 98,
+
+...commonLineConfig,
+
+});
+
+  
+
+// 站点标记（已到达）→ 彩色图标
+
+Marker.config.addConfig('sta-marker-arrived', {
+
+content: `<img src='已到达图标URL' />`,
+
+zIndex: 200,
+
+anchor: 'bottom-center',
+
+});
+
+  
+
+// 站点编号圆圈（无状态，只显示序号）
+
+Marker.config.addConfig('sta-marker-no', {
+
+zIndex: 201,
+
+anchor: 'center',
+
+cursor: 'pointer',
+
+});
+
+  
+
+// 车辆标记（行驶中/偏移）
+
+Marker.config.addConfig('car-marker-normal', { zIndex: 202, offset: [5, 0] });
+
+Marker.config.addConfig('car-marker-offset', { zIndex: 202, offset: [36, 0] });
+
+  
+
+// 起终点标记
+
+Marker.config.addConfig('end-point', {
+
+zIndex: 201,
+
+content: transformJsxToHtml(<NormalPointMarker>终</NormalPointMarker>),
+
+});
+
+Marker.config.addConfig('start-point', {
+
+zIndex: 201,
+
+content: transformJsxToHtml(<NormalPointMarker>起</NormalPointMarker>),
+
+});
+
+};
+
+```
+
+  
+
+**z-index 层级设计**（从上到下）：
+
+  
+
+| 层级 | 覆盖物 | zIndex |
+
+|------|--------|--------|
+
+| 最顶层 | 车辆标记 | 202 |
+
+| 次顶层 | 站点编号圆圈 / 起终点 | 201 |
+
+| 站点图标 | 已到达 / 未到达图标 | 200 |
+
+| 路线 | 历史路径（灰）| 100 |
+
+| 路线 | 规划路径-派送（蓝）| 99 |
+
+| 路线 | 规划路径-揽收（青）| 98 |
+
+  
+
+---
+
+  
+
+## 五、核心渲染逻辑：renderOverlays + useEffect
+
+  
+
+### 5.1 触发时机
+
+  
+
+```typescript
+
+// DeliveryMap/index.tsx:183
+
+useEffect(() => {
+
+if (!mapInitialized) return; // 守卫1：SDK 未就绪不渲染
+
+if (isEmpty(trajectoryInfo)) return; // 守卫2：无数据不渲染
+
+  
+
+const $map = Map.getInstance();
+
+if (!$map) return; // 守卫3：地图实例不存在
+
+  
+
+addOverlayConfig(); // 注册样式（幂等，重复调用无副作用）
+
+$map.clearMap(); // 清除所有旧覆盖物
+
+renderOverlays(trajectoryInfo); // 重新绘制
+
+// 自适应缩放到包含所有覆盖物的视野
+
+const overlays = $map?.getAllOverlays()?.filter(Boolean);
+
+if (overlays?.length > 0) {
+
+$map.setFitView(overlays);
+
+}
+
+}, [mapInitialized, trajectoryInfo]); // trajectoryInfo 变化就触发
+
+```
+
+  
+
+**三步骤的必要性**：
+
+- `clearMap()`：数据更新时旧覆盖物必须清除，否则新旧叠加（比如车辆标记会出现两个）
+
+- `renderOverlays()`：按新数据重绘所有覆盖物
+
+- `setFitView()`：数据变化后站点分布可能完全不同，需要重新计算最佳视野
+
+  
+
+### 5.2 renderOverlays：三类覆盖物的绘制
+
+  
+
+```typescript
+
+// DeliveryMap/index.tsx:59
+
+const renderOverlays = (data: TrajectoryInfo[]) => {
+
+const $map = Map.getInstance();
+
+  
+
+const overlaysArr = data.map((item) => {
+
+const { carPoints = [], routes = [], staPoints = [], endPoint, startPoint } = item;
+
+  
+
+// ① 站点编号标记（圆圈内显示序号，区分派送/揽收颜色）
+
+const staNoMarkers = staPoints
+
+.filter(o => Boolean(o?.wkt))
+
+.map((staPoint, index) => {
+
+return wktToOverlay(
+
+staPoint.wkt, // WKT 坐标字符串
+
+`${staPoint.staId}_${index}`, // 唯一 key
+
+staPoint, // 原始数据（挂在覆盖物上供点击事件使用）
+
+'sta-marker-no', // 样式 key，在 addOverlayConfig 中已注册
+
+{
+
+// 揽收点：绿色圆圈
+
+// 派送点：蓝色圆圈
+
+content: staPoint.type === StopOverPointType.PICK_POINT
+
+? `<span style="color:#097562; background:#d6fcf5; ...">${index + 1}</span>`
+
+: `<span style="color:#005be5; background:#d4e5ff; ...">${index + 1}</span>`,
+
+}
+
+);
+
+});
+
+  
+
+// ② 车辆位置标记（带 ETA 气泡）
+
+const carMarker = carPoints
+
+.filter(o => Boolean(o?.wkt))
+
+.map(carPoint => wktToOverlay(
+
+carPoint.wkt,
+
+carPoint.vehicleId,
+
+carPoint,
+
+`car-marker-${carPoint.status === CarStatus.Driving ? 'normal' : 'offset'}`,
+
+{ content: transformJsxToHtml(<CarMarker data={carPoint} />) }
+
+));
+
+  
+
+// ③ 路线（LINESTRING → Polyline）
+
+const routeLines = routes
+
+.filter(o => Boolean(o?.path))
+
+.map(route => wktToOverlay(
+
+route.path,
+
+route.subRecordId || uniqueId('route-line'),
+
+route,
+
+`route-line-${route.status}` // 'route-line-0'=蓝, 'route-line-1'=灰
+
+));
+
+  
+
+// ④ 起终点标记
+
+const endPointMarker = endPoint?.wkt &&
+
+wktToOverlay(endPoint.wkt, 'end-point', endPoint, 'end-point');
+
+const startPointMarker = startPoint?.wkt &&
+
+wktToOverlay(startPoint.wkt, 'start-point', startPoint, 'start-point');
+
+  
+
+return [staNoMarkers, carMarker, routeLines, endPointMarker, startPointMarker];
+
+});
+
+  
+
+// 展开并添加到地图
+
+overlaysArr.filter(Boolean).forEach(overlays => {
+
+overlays.filter(Boolean).forEach(overlay => {
+
+$map.add(overlay);
+
+});
+
+});
+
+};
+
+```
+
+  
+
+---
+
+  
+
+## 六、车辆气泡标记：CarMarker 组件
+
+  
+
+```typescript
+
+// CarMarker.tsx — 车辆图标 + ETA 信息气泡
+
+export const CarMarker: React.FC<CarMarkerProps> = ({ data }) => {
+
+return (
+
+<Box display="flex" alignItems="center">
+
+{/* 车辆图标（无人配送车图片）*/}
+
+<img
+
+style={{ width: '35px', height: '36px' }}
+
+src="无人车图标URL"
+
+/>
+
+{/* 只有有 ETA 数据时才显示气泡 */}
+
+{data?.etaAtNextSta && (
+
+<StyledArrow>
+
+{/* CSS 实现的左箭头（三角形），指向车辆图标 */}
+
+<div className="arrow-left" />
+
+<Text style={{ fontSize: '12px' }}>
+
+{data?.etaAtNextSta} {/* 如："10分钟" */}
+
+</Text>
+
+</StyledArrow>
+
+)}
+
+</Box>
+
+);
+
+};
+
+  
+
+// StyledArrow 样式（blue 气泡 + CSS 三角箭头）
+
+const StyledArrow = styled.div`
+
+background: #005be5;
+
+color: #ffffff;
+
+border-radius: 6px;
+
+padding: 6px;
+
+  
+
+.arrow-left {
+
+width: 0; height: 0;
+
+border-top: 10px solid transparent;
+
+border-bottom: 10px solid transparent;
+
+border-right: 10px solid #005be5; /* 产生向左的三角 */
+
+position: absolute;
+
+left: -8px;
+
+}
+
+`;
+
+```
+
+  
+
+> **面试要点**：`transformJsxToHtml` 是什么？
+
+> 答：高德地图的 Marker `content` 只接受 HTML 字符串，但我们用 React 组件写 `CarMarker` 更好维护。`transformJsxToHtml` 把 JSX 渲染成 HTML 字符串，再传给高德地图——这是 React 生态与非 React 地图 SDK 的桥接方案。
+
+  
+
+---
+
+  
+
+## 七、组件卸载清理：防止内存泄漏
+
+  
+
+```typescript
+
+// DeliveryMap/index.tsx:202
+
+useEffect(() => {
+
+return () => {
+
+// 离开页面时销毁地图实例
+
+// 不销毁的话：地图实例持有大量 DOM 引用，切页后这些内存无法被 GC 回收
+
+Map.getInstance() && Map.destroy();
+
+};
+
+}, []); // 空依赖，只在卸载时执行一次
+
+```
+
+  
+
+> **面试要点**：为什么要两个独立的 `useEffect`？
+
+> 答：第一个 `useEffect`（依赖 `trajectoryInfo`）负责渲染时机——数据变化就重绘；第二个（空依赖）负责清理——组件卸载时销毁。如果合并到一个 `useEffect` 里，每次 `trajectoryInfo` 更新都会触发 cleanup 函数（`Map.destroy()`），地图会被反复销毁。
+
+  
+
+---
+
+  
+
+## 八、TrajectoryInfo 数据结构
+
+  
+
+```typescript
+
+// 传入 DeliveryMap 的完整数据结构
+
+interface TrajectoryInfo {
+
+routes?: Array<{
+
+path: string; // WKT: "LINESTRING(lng lat, ...)"
+
+status: number; // 0=规划路径(蓝), 1=历史路径(灰)
+
+subRecordId?: string;
+
+}>;
+
+staPoints?: Array<{
+
+staId: string | number;
+
+wkt: string; // WKT: "POINT(lng lat)"
+
+eta?: string; // "14:30预计到达"
+
+status?: number;
+
+type?: string; // "POST_POINT" | "PICK_POINT"
+
+}>;
+
+carPoints?: Array<{
+
+wkt: string; // WKT: "POINT(lng lat)"
+
+vehicleId: string;
+
+status: CarStatus; // Driving | Waiting
+
+etaAtNextSta?: string; // "10分钟"（到下一站）
+
+}>;
+
+startPoint?: { wkt: string };
+
+endPoint?: { wkt: string };
+
+showButtons?: string[]; // 控制地图上显示哪些操作按钮
+
+}
+
+```
+
+  
+
+---
+
+  
+
+## 九、面试高频追问
+
+  
+
+### Q1：双轨迹是怎么区分颜色的？
+
+  
+
+> `routes` 数组里每条路线都有 `status` 字段：`0` 代表规划路径（未走），`1` 代表历史路径（已走）。`wktToOverlay` 的第四个参数是样式 key，传入 `route-line-${status}` 就能在 `addOverlayConfig` 中查到对应配置——`route-line-0` 对应蓝色，`route-line-1` 对应灰色。颜色完全由配置决定，渲染逻辑不硬编码颜色。
+
+  
+
+### Q2：为什么每次数据更新都要先 clearMap 再重绘？
+
+  
+
+> 高德地图的覆盖物是手动管理的，不像 React 组件有 Virtual DOM 做 diff。如果不 `clearMap()`，新旧覆盖物会叠加——比如车辆在行驶过程中每 5 秒更新一次位置，不清除的话地图上会出现多个车辆图标。`clearMap → renderOverlays` 是最简单可靠的全量更新策略。
+
+  
+
+### Q3：setFitView 是做什么的，为什么在 renderOverlays 之后调用？
+
+  
+
+> `setFitView` 让地图自动调整中心点和缩放级别，使所有覆盖物都在视野内可见。必须在 `renderOverlays` 之后调用，因为 `setFitView` 需要传入当前地图上的所有覆盖物引用（`$map.getAllOverlays()`）才能计算边界框——提前调用拿不到覆盖物，视野不会正确调整。
+
+  
+
+### Q4：mapReady 状态的作用是什么？
+
+  
+
+> 高德 SDK 是异步加载的（`AMapLoader.load` 返回 Promise），地图实例创建好之前 `Map.getInstance()` 返回 null。`mapReady` 是一个布尔状态，SDK 就绪后设为 `true`，`trajectoryInfo` 的渲染 `useEffect` 以它作为守卫条件，确保不会在地图实例创建前提前调用渲染方法。
+
+  
+
+### Q5：WKT 格式的坐标顺序是什么？和平时说的"经纬度"一样吗？
+
+  
+
+> WKT 格式是 **经度（lng）在前，纬度（lat）在后**，即 `POINT(经度 纬度)`。这和平时口语"先纬度再经度"相反。代码里拼 WKT 字符串时是 `${s.lng} ${s.lat}`，不能写反，否则站点会出现在地球另一侧。
+
+  
+
+---
+
+  
+
+## 十、知识点索引（快速定位代码）
+
+  
+
+| 知识点 | 文件 | 行号 |
+
+|--------|------|------|
+
+| SDK 动态加载 + 地图初始化 | `DeliveryMap/useMapInitialize.ts` | 6-32 |
+
+| 组件卸载 Map.destroy() | `DeliveryMap/index.tsx` | 202-206 |
+
+| 覆盖物样式注册 addOverlayConfig | `DeliveryMap/utils.tsx` | 32-102 |
+
+| 路线颜色配置（蓝/灰） | `DeliveryMap/utils.tsx` | 42-61 |
+
+| 数据变化触发重绘 useEffect | `DeliveryMap/index.tsx` | 183-200 |
+
+| clearMap → renderOverlays → setFitView | `DeliveryMap/index.tsx` | 194-199 |
+
+| 站点圆圈标记渲染 | `DeliveryMap/index.tsx` | 71-118 |
+
+| 车辆位置标记渲染 | `DeliveryMap/index.tsx` | 120-133 |
+
+| 路线 Polyline 渲染 | `DeliveryMap/index.tsx` | 135-144 |
+
+| CarMarker 气泡组件 | `DeliveryMap/CarMarker.tsx` | 48-87 |
+
+| 详情页坐标→WKT 组装 | `DetailMap/index.tsx` | 459-479 |
+
+| 发车页坐标→WKT 组装 | `CreateRecordMap/index.tsx` | 400-435 |
