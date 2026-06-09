@@ -1291,3 +1291,1518 @@ A：因为它不是单纯“加埋点按钮”，而是一个有明确业务痛�
 
 > 我在一个真实业务场景里，做了一套前端侧的链路可观测性建设，把页面访问、关键行为、用户身份和接口异常统一起来，让业务链路既能做转化分析，也能做线上异常排查。
 
+---
+
+# 离职后补充版：代码级复盘与面试深挖材料
+
+这一部分的目的，是帮你在离职后没有项目源码的情况下，仍然可以只靠这份文档复盘“当时到底怎么做的”。所以这里不再把重点放在“去哪个文件查”，而是把核心代码结构、伪代码、事件和接口链路都写进文档里。文件名只作为历史归属标签，帮助你面试时显得真实，不作为复习依赖。
+
+## 0. 离职后先背这 8 段代码骨架
+
+如果面试前只剩 10 分钟，不要想着“原项目文件在哪里”，而是背下面这 8 个代码骨架。它们已经覆盖了这个项目最容易被追问的实现细节。
+
+| 代码骨架 | 面试要讲的点 |
+| --- | --- |
+| SDK 初始化 | 环境隔离、版本标记、生产开关、ZEM 客户端 |
+| App 注入 | `ZEMProvider` 包住全应用，让页面 Hook 能拿到埋点能力 |
+| 页面曝光 | `PageLayout + useDidShow + _track_from` |
+| 身份绑定 | 登录用户强身份、取件码用户弱身份 |
+| 请求底座 | HTTP 非 2xx 上报 `RequestError` |
+| 响应拦截 | HTTP 200 但业务失败上报 `ServerException` |
+| 分区路由 | `X-Partition-Vehicle` 查询车辆分区并缓存 |
+| 开箱链路 | `openBox -> updateStatus -> completePick` |
+
+一句话记忆：
+
+> 初始化、曝光、身份、异常、分区、开箱这六件事串起来，就是这个埋点体系的技术主线。
+
+### 0.1 自包含代码快照：全局埋点初始化
+
+```ts
+// 伪代码：初始化埋点 SDK
+function getEnvironment() {
+  if (process.env.NODE_ENV === 'development') {
+    return 'dev';
+  }
+
+  const { miniProgram } = getAccountInfoSync();
+  if (miniProgram.envVersion === 'develop') return 'dev';
+  if (miniProgram.envVersion === 'trial') return 'uat';
+  return 'prod';
+}
+
+function getVersion() {
+  const { miniProgram } = getAccountInfoSync();
+  return miniProgram.version || 'unknown';
+}
+
+const zemClient = createZEMClient({
+  appKey: 'mini_pick',
+  environment: getEnvironment(),
+  version: getVersion(),
+  enable: process.env.NODE_ENV === 'production',
+  debug: getEnvironment() !== 'prod',
+  volcano: {
+    projectId: '火山项目 ID',
+    topicId: '火山日志 topic ID',
+  },
+});
+```
+
+记忆点：
+
+1. `environment` 解决环境隔离。
+2. `version` 解决版本追踪。
+3. `enable` 解决开发数据污染。
+4. `debug` 解决非生产联调。
+
+### 0.2 自包含代码快照：App 全局注入
+
+```tsx
+// 伪代码：应用根组件
+function App({ children }) {
+  const refetchUser = useUserStore(state => state.refetch);
+
+  useLaunch(() => {
+    // 小程序启动时恢复登录态，并在成功后做 identify
+    refetchUser();
+  });
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ZEMProvider client={zemClient}>
+        {children}
+      </ZEMProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+记忆点：
+
+1. `ZEMProvider` 是埋点能力的上下文入口。
+2. 页面中 `useTrackClick/useTrackPageView` 能工作，是因为这里全局注入了 `zemClient`。
+3. `useLaunch -> refetchUser` 让登录用户进入小程序时能恢复身份。
+
+### 0.3 自包含代码快照：页面曝光统一上报
+
+```tsx
+// 伪代码：公共页面容器
+let lastPath: string | undefined;
+
+function PageLayout({ title, children }) {
+  const router = useRouter();
+  const trackPageView = useTrackPageView();
+
+  useDidShow(() => {
+    const { $taroTimestamp, ...params } = router.params;
+
+    trackPageView(
+      router.path,
+      typeof title === 'string' ? title : router.path,
+      {
+        ...params,
+        _track_from: lastPath,
+      }
+    );
+
+    lastPath = router.path;
+  });
+
+  return <Page title={title}>{children}</Page>;
+}
+```
+
+记忆点：
+
+1. 小程序页面返回时不一定重新挂载，所以用 `useDidShow`。
+2. `_track_from` 用于还原来源页面。
+3. `$taroTimestamp` 属于噪音参数，所以过滤掉。
+4. 曝光逻辑放公共容器，避免每个页面重复写。
+
+### 0.4 自包含代码快照：登录用户身份绑定
+
+```ts
+// 伪代码：登录成功后恢复用户身份
+async function handleLoginSuccess() {
+  const user = await getCurrentUser();
+
+  zemClient.identify({
+    userId: user.id,
+    userName: user.username,
+  });
+
+  zemClient.logger.info('mobileNumber', {
+    mobileNumber: user.mobileNumber,
+  });
+
+  setUserStore({
+    user,
+    isAuthenticated: true,
+  });
+}
+```
+
+记忆点：
+
+1. `identify` 绑定强身份。
+2. `mobileNumber` 单独作为业务日志记录。
+3. 这一步让页面、点击、异常都能回到具体用户。
+
+### 0.5 自包含代码快照：取件码免登录弱身份
+
+```ts
+// 伪代码：取件码查单成功后绑定弱身份
+async function handleCodeConfirm(verifyCode: string) {
+  clearVehiclePartitionCache();
+
+  const res = await getOrderByCode(verifyCode);
+  const firstOrder = res.dispatch.orderList[0];
+
+  if (!firstOrder) {
+    showToast('暂无货单信息');
+    return;
+  }
+
+  zemClient.identify({
+    userId: '',
+    userName: firstOrder.name,
+  });
+
+  zemClient.logger.info('mobileNumber', {
+    mobileNumber: firstOrder.contact,
+  });
+
+  navigateTo('/pages/orderList/index', {
+    type: 'CODE',
+    vehicleName: res.name,
+    verifyCode,
+  });
+}
+```
+
+记忆点：
+
+1. 取件码链路不要求登录，所以没有稳定 `userId`。
+2. 用收件人姓名和联系电话做弱身份。
+3. 这样免登录链路也不是匿名黑盒。
+
+### 0.6 自包含代码快照：请求异常统一上报
+
+```ts
+// 伪代码：请求底座
+async function request(config) {
+  const finalConfig = await runRequestInterceptors(config);
+  const response = await Taro.request(finalConfig);
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    zemClient.exceptionReporter.report(
+      new RequestError({
+        message: response.data?.error_description || response.data?.error,
+        statusCode: response.statusCode,
+        url: finalConfig.url,
+        method: finalConfig.method,
+        data: finalConfig.data,
+        response: response.data,
+      })
+    );
+
+    throw new RequestError('HTTP 请求失败');
+  }
+
+  response.config = finalConfig;
+  return runResponseInterceptors(response);
+}
+```
+
+记忆点：
+
+1. HTTP 非 2xx 在最底层统一处理。
+2. 统一带上 URL、method、data、response。
+3. 页面代码不用每个接口重复写异常埋点。
+
+### 0.7 自包含代码快照：业务异常和网络异常
+
+```ts
+// 伪代码：业务响应拦截器
+function responseFulfilled(response) {
+  const { success, isSuccess, data, message, errorCode } = response.data;
+
+  if (success || isSuccess) {
+    return data;
+  }
+
+  zemClient.exceptionReporter.report(
+    new ServerException({
+      message,
+      code: errorCode,
+      url: response.config.url,
+      method: response.config.method,
+      extra: {
+        data: response.config.data,
+      },
+    })
+  );
+
+  showToast(message);
+  throw new ServerError(message, errorCode);
+}
+
+function responseRejected(error, config) {
+  try {
+    zemClient.exceptionReporter.report(
+      new NetworkException({
+        message: error.message || error.errMsg,
+        code: error.code,
+        url: config.url,
+        method: config.method,
+        extra: {
+          data: config.data,
+          status: error.response?.status,
+        },
+      })
+    );
+  } catch (reportError) {
+    zemClient.exceptionReporter.report(
+      new UnknownException(reportError)
+    );
+  }
+
+  throw normalizeNetworkError(error);
+}
+```
+
+记忆点：
+
+1. `RequestError` 看 HTTP 层。
+2. `ServerException` 看 HTTP 200 但业务失败。
+3. `NetworkException` 看断网、超时、小程序 request fail。
+4. `UnknownException` 兜底上报过程自己的异常。
+
+### 0.8 自包含代码快照：车辆分区路由
+
+```ts
+// 伪代码：车辆分区请求拦截器
+const VEHICLE_HEADER = 'X-Partition-Vehicle';
+const vehiclePartitionCache = new Map<string, Promise<Partition | null>>();
+
+request.interceptors.request.use(async config => {
+  const vehicleName = config.headers?.[VEHICLE_HEADER];
+  if (!vehicleName) return config;
+
+  const partition = await getVehiclePartitionWithCache(vehicleName);
+  if (partition?.gatewayHost) {
+    config.baseURL = `https://${partition.gatewayHost}`;
+  }
+
+  return config;
+});
+
+async function getVehiclePartitionWithCache(vehicleName: string) {
+  let promise = vehiclePartitionCache.get(vehicleName);
+
+  if (!promise) {
+    promise = getVehiclePartition(vehicleName).catch(error => {
+      vehiclePartitionCache.delete(vehicleName);
+      throw error;
+    });
+    vehiclePartitionCache.set(vehicleName, promise);
+  }
+
+  return promise;
+}
+
+function clearVehiclePartitionCache() {
+  vehiclePartitionCache.clear();
+}
+```
+
+记忆点：
+
+1. 开箱、手机号查单、完成取件都要带车辆名。
+2. 请求前根据车辆查分区网关。
+3. 缓存 Promise，避免并发重复查分区。
+4. 扫码或输入取件码前清缓存，避免上一辆车影响下一辆车。
+
+### 0.9 自包含代码快照：开箱与完成取件链路
+
+```ts
+// 伪代码：开箱不是单点动作，而是组合链路
+async function handleOpenBox(vehicleName, gridNos, orderIds, autoOpen) {
+  try {
+    startCountdown();
+
+    await openBox(vehicleName, gridNos, autoOpen);
+
+    await updateStatus(vehicleName, orderIds, {
+      action: 'PICKED',
+    });
+  } catch (error) {
+    stopCountdown();
+    throw error;
+  }
+}
+
+async function handleConfirmCompletePick(vehicleName, orderList) {
+  const orderIds = orderList.map(order => order.id);
+
+  await batchCompletePick(vehicleName, orderIds);
+
+  const shouldSubscribe = await checkShouldShowSubscribeConfirm();
+  if (shouldSubscribe) {
+    showSubscribeConfirm();
+  } else {
+    reLaunch('/pages/index/index');
+  }
+}
+```
+
+记忆点：
+
+1. “开门”不等于“取件完成”。
+2. 开箱后还要更新订单状态为 `PICKED`。
+3. 完成取件要调用 `batch_complete_pick`。
+4. 完成后还有订阅提醒收尾流程。
+
+### 0.10 自包含代码快照：页面关键操作埋点
+
+下面这段不用背到每个括号都一样，但要记住“点击事件 -> 业务动作 -> 跳转/接口”的结构。
+
+```tsx
+// 伪代码：首页扫码入口
+function HomePage() {
+  const trackClick = useTrackClick();
+  const { mobileNumber } = useCurrentUser();
+
+  async function handleScanClick() {
+    trackClick('首页扫码按钮', '首页扫码按钮', String(mobileNumber));
+
+    if (!mobileNumber) {
+      navigateTo('/pages/login/index');
+      return;
+    }
+
+    Taro.scanCode({
+      onlyFromCamera: true,
+      scanType: 'QR_CODE',
+      success: async result => {
+        const vehicleName =
+          parseVehicleName(result.result) ||
+          (await getZelosVehicleName(result.result)).name;
+
+        clearVehiclePartitionCache();
+
+        const orderResult = await getOrderByPhone(vehicleName, mobileNumber);
+        const orderList = orderResult.dispatch.orderList || [];
+
+        if (!orderList.length) {
+          showToast('暂无货单信息');
+          return;
+        }
+
+        navigateTo('/pages/orderList/index', {
+          type: 'PHONE',
+          vehicleName,
+          mobileNumber,
+        });
+      },
+    });
+  }
+
+  return <Button onClick={handleScanClick}>扫一扫取货</Button>;
+}
+```
+
+```tsx
+// 伪代码：货单列表开门 / 开格口 / 完成取件
+function OrderListPage() {
+  const trackClick = useTrackClick();
+  const { orderList, vehicleName } = useOrderList();
+  const { canClick, time, handleOpenBox } = useOpenBox();
+
+  function handleOpenDoor(order) {
+    trackClick('货单列表开门取货', '货单列表开门取货');
+
+    const grids = order.gridNo.split(',');
+    handleOpenBox(vehicleName, grids, [order.id], false);
+  }
+
+  function handleOpenGrid(order, gridNo) {
+    trackClick('货单列表开格口', '货单列表开格口', String([gridNo]));
+    handleOpenBox(vehicleName, [gridNo], [order.id], false);
+  }
+
+  function handleCompleteClick() {
+    trackClick('货单列表完成取件', '货单列表完成取件');
+    showCompleteConfirmModal();
+  }
+
+  async function handleCompleteConfirm() {
+    trackClick('货单列表确认完成取件', '货单列表确认完成取件');
+
+    const orderIds = orderList.map(order => order.id);
+    await batchCompletePick(vehicleName, orderIds);
+
+    await continueSubscribeFlowOrBackHome();
+  }
+
+  return (
+    <View>
+      {orderList.map(order => (
+        <OrderCard
+          onOpenDoor={() => handleOpenDoor(order)}
+          onOpenGrid={gridNo => handleOpenGrid(order, gridNo)}
+        />
+      ))}
+
+      <Button disabled={!canClick} onClick={handleCompleteClick}>
+        {canClick ? '完成取件' : `完成取件(${time})`}
+      </Button>
+    </View>
+  );
+}
+```
+
+```ts
+// 伪代码：完成取件后的订阅提醒日志
+async function continueSubscribeFlowOrBackHome() {
+  const setting = await Taro.getSetting({ withSubscriptions: true });
+
+  zemClient.logger.info('getSetting', {
+    codeTemplateStatus: setting.subscriptionsSetting?.[CODE_TEMP_ID],
+    vehicleTemplateStatus: setting.subscriptionsSetting?.[VEHICLE_TEMP_ID],
+    page: '货单列表页',
+  });
+
+  const registered = await checkWxMiniappRegisted({
+    loginCode: (await Taro.login()).code,
+  });
+
+  zemClient.logger.info('checkWxMiniappRegisted', {
+    isRegisted: registered,
+    page: '货单列表页',
+  });
+
+  if (!registered) {
+    reLaunch('/pages/index/index');
+    return;
+  }
+
+  Taro.requestSubscribeMessage({
+    tmplIds: [CODE_TEMP_ID, VEHICLE_TEMP_ID],
+    success: res => {
+      zemClient.logger.info('requestSubscribeMessageSuccess', {
+        page: '货单列表页',
+        res: JSON.stringify(res),
+      });
+    },
+    fail: res => {
+      zemClient.logger.info('requestSubscribeMessageFail', {
+        page: '货单列表页',
+        res: JSON.stringify(res),
+      });
+    },
+    complete: res => {
+      zemClient.logger.info('requestSubscribeMessageComplete', {
+        page: '货单列表页',
+        res: JSON.stringify(res),
+      });
+      reLaunch('/pages/index/index');
+    },
+  });
+}
+```
+
+记忆点：
+
+1. 点击埋点一定放在用户动作发生时。
+2. 业务接口异常交给请求层统一处理。
+3. 完成取件不是结束，订阅提醒也是收尾链路的一部分。
+
+---
+
+## 1. 真实代码细节：ZEM 初始化到底做了什么
+
+历史实现归属：`src/tracker/zem.ts`。离职后不用依赖源码，背下面这段逻辑即可。
+
+核心逻辑：
+
+```ts
+const isProduction = process.env.NODE_ENV === 'production';
+
+const getEnvironment = (): 'dev' | 'uat' | 'prod' => {
+  if (process.env.NODE_ENV === 'development') return 'dev';
+
+  const { miniProgram } = getAccountInfoSync();
+  if (miniProgram.envVersion === 'develop') return 'dev';
+  if (miniProgram.envVersion === 'trial') return 'uat';
+
+  return 'prod';
+};
+
+export const zemClient = createZEMClient({
+  appKey: 'mini_pick',
+  environment: getEnvironment(),
+  enable: isProduction,
+  version: getVersion(),
+  debug: getEnvironment() !== 'prod',
+  volcano: {
+    projectId: '0479500c-d347-4eec-8aa4-ebced5b57568',
+    topicId: 'adb2f886-b7a6-449d-907a-08e21122eee1',
+  },
+});
+```
+
+面试要点：
+
+1. `appKey = mini_pick`：标识当前业务应用。
+2. `environment`：通过小程序 `envVersion` 区分开发版、体验版、正式版。
+3. `version`：记录小程序版本，方便版本维度排障。
+4. `enable: isProduction`：只有生产构建真正启用，避免开发数据污染。
+5. `debug: getEnvironment() !== 'prod'`：非生产打开调试能力，便于联调。
+6. `volcano.projectId/topicId`：数据落到火山日志/埋点主题，方便后续检索分析。
+
+可直接背：
+
+> 我在 SDK 初始化阶段就做了数据质量治理，主要是环境隔离、版本标记和生产开关。这样后面分析漏斗或异常率时，不会被开发联调数据污染。
+
+---
+
+## 2. 真实代码细节：为什么页面曝光用 `PageLayout`
+
+历史实现归属：`src/biz-components/PageLayout/index.tsx`。重点不是文件名，而是 `PageLayout + useDidShow + _track_from` 这套结构。
+
+核心逻辑：
+
+```ts
+let lastPath: string;
+
+export function PageLayout(props: PageLayoutProps) {
+  const router = useRouter();
+  const trackPageView = useTrackPageView();
+  const tackTitle = typeof title === 'string' ? title : router.path;
+
+  useDidShow(() => {
+    const { $taroTimestamp, ...trackParams } = router.params;
+    trackPageView(router.path, tackTitle, {
+      ...trackParams,
+      _track_from: lastPath,
+    });
+    lastPath = router.path;
+  });
+}
+```
+
+这里有几个细节非常值得讲：
+
+1. `useDidShow` 而不是 `useEffect`
+   小程序页面返回时经常只是重新显示，不一定重新挂载。用 `useDidShow` 可以覆盖“从详情返回列表”“从登录返回首页”这类真实曝光。
+
+2. `lastPath`
+   用模块级变量保存上一页路径，上报到 `_track_from`，用于还原路径。
+
+3. 过滤 `$taroTimestamp`
+   Taro 路由参数里可能带时间戳噪音，过滤掉后能减少无意义维度。
+
+4. 页面标题兜底
+   有标题用标题，没有标题就用路由路径，保证 page view 至少有稳定名称。
+
+面试可展开：
+
+> 页面曝光是横切关注点，所以我没有让每个页面单独写埋点，而是沉到公共页面容器。这样所有使用 `PageLayout` 的页面天然具备页面访问埋点，并且字段结构一致。
+
+可能被追问的边界：
+
+1. `lastPath` 是全局变量，能满足小程序单实例页面路径追踪，但如果要做更严谨的多页面栈分析，可以读取 `getCurrentPages()` 做路径栈。
+2. 当前 `_track_from` 只有上一页路径，没有完整 query；如果要做更精细来源分析，可以同时记录上一页参数。
+
+---
+
+## 3. 真实代码细节：身份绑定分强身份和弱身份
+
+### 登录用户强身份
+
+历史实现归属：`src/store/user.ts`。重点是登录成功后拿业务用户资料，再做 `identify`。
+
+核心逻辑：
+
+```ts
+const [user] = await Promise.all([getCurrentUser()]);
+
+zemClient.identify({
+  userId: user.id,
+  userName: user.username,
+});
+
+zemClient.logger.info('mobileNumber', {
+  mobileNumber: user.mobileNumber,
+});
+```
+
+说明：
+
+1. `identify` 绑定 `user.id` 和 `username`。
+2. 手机号没有放进 `identify`，而是作为业务日志 `mobileNumber` 记录。
+3. 触发点在 `handleLoginSuccess()`，由 SSO 登录事件和应用启动 `refetch()` 间接触发。
+
+### 取件码免登录弱身份
+
+历史实现归属：`src/pages/code/index.tsx`。重点是取件码查单成功后，用货单里的收件人信息做弱身份。
+
+核心逻辑：
+
+```ts
+const res = await getOrderByCode(verifyCode);
+
+zemClient.identify({
+  userId: '',
+  userName: res?.dispatch?.orderList?.[0]?.name,
+});
+
+zemClient.logger.info('mobileNumber', {
+  mobileNumber: res?.dispatch?.orderList?.[0]?.contact,
+});
+```
+
+说明：
+
+1. 取件码链路可能不登录，所以没有稳定 `userId`。
+2. 用收件人姓名和联系电话做弱身份关联。
+3. 这让“取件码取货失败”的用户也能被回查，而不是匿名事件。
+
+面试可直接说：
+
+> 我把身份分成强身份和弱身份。登录用户用业务用户 ID 绑定，免登录取件码用户用收件人姓名和联系电话做弱关联。这样两条入口都能按人回放链路。
+
+合规补充：
+
+> 如果继续演进，我会把手机号和取件码改成 hash 或脱敏字段，并通过字段白名单控制上报范围。
+
+---
+
+## 4. 真实代码细节：异常上报不是一个点，而是两层拦截
+
+### 第一层：HTTP 非 2xx
+
+历史实现归属：`src/lib/request/request.ts`。重点是 HTTP 非 2xx 在请求底座统一上报。
+
+核心逻辑：
+
+```ts
+if (response.statusCode < 200 || response.statusCode >= 300) {
+  zemClient.exceptionReporter.report(
+    new RequestError(
+      response?.data?.error_description || response?.data?.error,
+      response.statusCode,
+      response,
+      mergedConfig
+    )
+  );
+
+  throw new RequestError(...);
+}
+```
+
+这一层解决：
+
+1. HTTP 4xx/5xx。
+2. 网关、鉴权、服务器错误。
+3. 上报时带 `response` 和 `mergedConfig`，可以反查 URL、method、headers、data。
+
+### 第二层：业务响应失败
+
+历史实现归属：`src/api/request.ts`。重点是 HTTP 200 但 `success/isSuccess` 不成立也算业务异常。
+
+核心逻辑：
+
+```ts
+const { success, isSuccess, data, message: msg, errorCode } = response.data;
+
+if (success || isSuccess) {
+  return data;
+}
+
+zemClient.exceptionReporter.report(
+  new ServerException({
+    message: msg,
+    code: errorCode,
+    url,
+    method,
+    extra: {
+      data: response.config?.data,
+      url: response.config?.url,
+      method: response.config?.method,
+    },
+  })
+);
+
+return Promise.reject(new ServerError(msg, errorCode, response.data));
+```
+
+这一层解决：
+
+1. HTTP 200 但业务失败。
+2. 业务错误码统一收口。
+3. 前端页面不用每个接口单独 try/catch 上报。
+
+### 第三层：网络异常和未知异常
+
+历史实现归属：`src/api/request.ts`。重点是 rejected 分支兜住网络异常，上报失败再用未知异常兜底。
+
+核心逻辑：
+
+```ts
+try {
+  zemClient.exceptionReporter.report(
+    new NetworkException({
+      message: error.message ?? error.errMsg,
+      code: error.code,
+      url: config.url,
+      method: config.method,
+      extra: {
+        data: config.data,
+        status: error.response?.status,
+      },
+    })
+  );
+} catch (e) {
+  zemClient.exceptionReporter.report(new UnknownException(e as any));
+}
+```
+
+面试可直接说：
+
+> 我把异常分成 HTTP 异常、业务异常、网络异常和上报兜底异常。这个拆分很重要，因为小程序取货问题里很多不是 HTTP 失败，而是 HTTP 200 但业务状态不允许，比如取件码无效、车辆分区不对、订单状态不允许开箱。
+
+注意边界：
+
+1. 当前 `RequestError` 使用的是项目自定义错误类，不是 SDK 里的异常类；如果 ZEM SDK 要求固定异常类型，后续可以包装成 SDK 标准异常。
+2. 当前业务失败会 `showToast`，同时上报异常；这适合排障，但要避免把预期内的频繁业务提示都当成高危故障。
+
+---
+
+## 5. 真实代码细节：车辆分区为什么是可观测性的一部分
+
+历史实现归属：`src/lib/partition/index.ts` 和 `src/api/order.ts`。重点是业务接口通过 `X-Partition-Vehicle` 把车辆名传给请求拦截器。
+
+业务接口上会这样带 header：
+
+```ts
+export const openBox = (vehicleName, gridNos, autoOpen) => {
+  return requestWithoutAuth.post(
+    `/client-server/send_open_box_with_grid`,
+    { vehicleName, gridNos, autoOpen },
+    {
+      headers: {
+        [VEHICLE_HEADER]: vehicleName,
+      },
+    }
+  );
+};
+```
+
+分区拦截器会这样处理：
+
+```ts
+const vehicleName = headers[VEHICLE_HEADER];
+
+if (vehicleName) {
+  const partitionUrl = await getVehiclePartitionUrl(vehicleName);
+  if (partitionUrl) {
+    config.baseURL = `https://${partitionUrl}`;
+  }
+}
+```
+
+缓存逻辑：
+
+```ts
+let partitionPromise = vehiclePartitionCache.get(vehicleName);
+
+if (!partitionPromise) {
+  partitionPromise = getVehiclePartition(vehicleName).catch(error => {
+    vehiclePartitionCache.delete(vehicleName);
+    throw error;
+  });
+  vehiclePartitionCache.set(vehicleName, partitionPromise);
+}
+```
+
+为什么面试要讲它：
+
+1. 取货链路不是固定打一个后端网关。
+2. 开箱、查单、更新状态都和车辆所属分区有关。
+3. 如果车辆分区错了，用户看到的是“查不到单/开不了门”，排障时必须知道请求是否命中了正确分区。
+4. 缓存的是 Promise，不只是结果，可以避免同一车辆并发请求重复查分区。
+5. `clearVehiclePartitionCache()` 在扫码或输入取件码前调用，避免上一次车辆分区影响下一次链路。
+
+可直接背：
+
+> 这个细节体现了我不是只看埋点 SDK，而是关注业务上下文是否正确。车辆分区如果错了，链路数据也会误导排查，所以我把分区路由也纳入了取货链路可观测性的解释里。
+
+---
+
+## 6. 真实代码细节：开箱不是一个接口，是一个组合链路
+
+历史实现归属：`src/pages/orderList/useOpenBox.ts`。重点是 `openBox` 后还要 `updateStatus`。
+
+核心逻辑：
+
+```ts
+const handleOpenBox = async (
+  vehicleName: string,
+  gridNos: string[],
+  orderIds: number[] | string[],
+  atuoOpen: boolean
+) => {
+  try {
+    start();
+    await doOpenBox(vehicleName, gridNos, atuoOpen);
+    await doUpdateStatus(vehicleName, orderIds);
+  } catch (error) {
+    console.error('处理开箱操作异常:', error);
+  }
+};
+```
+
+其中：
+
+```ts
+await openBox(vehicleName, gridNos, atuoOpen);
+await updateStatus(vehicleName, orderIds);
+```
+
+对应接口：
+
+1. `openBox` -> `/client-server/send_open_box_with_grid`
+2. `updateStatus` -> `/business-server/android/order/status/update`
+
+面试重点：
+
+1. 用户点击“开门取货/开格口/一键全开”只是触发动作。
+2. 真正的业务推进包括开箱和状态更新。
+3. 开箱失败会 `stop()` 倒计时，避免完成取件按钮被错误锁住。
+4. 自动开箱和手动开箱都复用了同一个 `handleOpenBox`，用 `autoOpen` 参数区分。
+
+可以这样回答“你怎么定义关键节点”：
+
+> 我会区分用户行为节点和业务状态节点。比如点击开门是行为节点，开箱接口成功和订单状态更新才是业务推进节点。埋点体系要能同时看到这两层，否则容易把“用户点了”误判成“业务完成了”。
+
+---
+
+## 7. 完整取货链路时序：扫码入口
+
+下面是扫码取货真实链路，可以按这个顺序回忆代码：
+
+```text
+首页曝光
+  PageLayout.trackPageView('/pages/index/index')
+
+点击首页扫码按钮
+  src/pages/index/index.tsx
+  trackClick('首页扫码按钮', '首页扫码按钮', String(mobileNumber))
+
+如果未登录
+  navigateTo('/pages/login/index')
+
+如果已登录
+  Taro.scanCode()
+  解析二维码里的 vehicleName / vehicle_name
+  如果解析不到，调用 getZelosVehicleName(res.result)
+
+扫码前清理车辆分区缓存
+  clearVehiclePartitionCache()
+
+查手机号对应货单
+  getOrderByPhone(vehicleName, mobileNumber)
+  POST /business-server/order/get_by_phone
+  headers: X-Partition-Vehicle = vehicleName
+
+进入货单列表页
+  navigateTo('/pages/orderList/index', {
+    type: 'PHONE',
+    vehicleName,
+    mobileNumber
+  })
+
+货单列表页曝光
+  PageLayout.trackPageView('/pages/orderList/index', params)
+
+货单列表拉取数据
+  useList.getList()
+  getOrderByPhone(vehicleName, mobileNumber)
+
+自动开箱判断
+  autoOpen = true: 遍历未取货订单自动开箱
+  autoOpen = false 且只有一个订单一个格口: 自动开箱
+  type = MESSAGE 且非平板车: 不自动开箱
+
+用户手动操作
+  货单列表开门取货 / 开格口 / 一键全开
+
+开箱链路
+  openBox()
+  updateStatus()
+
+完成取件
+  trackClick('货单列表完成取件')
+  弹确认框
+  trackClick('货单列表确认完成取件')
+  batchCompletePick(vehicleName, orderIds)
+  POST /business-server/order/batch_complete_pick
+
+订阅提醒
+  getSetting/checkWxMiniappRegisted
+  requestSubscribeMessage
+  logger.info('requestSubscribeMessageSuccess/Fail/Complete')
+
+回首页
+  reLaunch('/pages/index/index')
+```
+
+扫码链路里最容易被问的 3 个细节：
+
+1. 为什么扫码前要清分区缓存？
+   因为用户可能连续扫不同车辆，旧车辆分区不能影响新车辆请求。
+
+2. 为什么首页扫码要带 `mobileNumber`？
+   因为扫码入口按手机号查货单，未登录没有手机号就先跳登录。
+
+3. 为什么进入列表后还要重新查一遍货单？
+   首页先查是为了判断有没有单和确定能否进入列表；列表页重新查是为了拿最新货单状态和自动开箱配置。
+
+---
+
+## 8. 完整取货链路时序：取件码入口
+
+```text
+首页点击取件码取货
+  trackClick('首页取件码取货按钮')
+  navigateTo('/pages/code/index')
+
+取件码页曝光
+  PageLayout.trackPageView('/pages/code/index')
+
+输入 6 位取件码
+  CustomCodeInput
+
+点击确认
+  handleConfirm()
+  clearVehiclePartitionCache()
+  getOrderByCode(verifyCode)
+  POST /business-proxy/orders/get_by_code
+
+有货单
+  vehicleName = res.name
+  identify({ userId: '', userName: firstOrder.name })
+  logger.info('mobileNumber', firstOrder.contact)
+
+进入货单列表
+  navigateTo('/pages/orderList/index', {
+    type: 'CODE',
+    vehicleName,
+    verifyCode
+  })
+
+列表页按取件码重新查单
+  useList.getList()
+  getOrderByCode(verifyCode)
+
+后续开箱、完成取件、订阅提醒
+  同扫码链路
+```
+
+面试重点：
+
+1. 取件码链路是免登录入口，所以身份关联要靠货单里的姓名和联系方式。
+2. `type = CODE` 会影响列表页查单方式。
+3. 当前“确认取件码”按钮没有单独 `useTrackClick`，但页面曝光、接口异常、弱身份和后续列表页行为能够串起链路。
+
+可主动优化：
+
+> 如果继续完善，我会给取件码确认按钮补一个明确事件，比如 `取件码确认按钮`，并把取件码本身脱敏后作为参数，方便分析错误取件码和有效取件码的转化差异。
+
+---
+
+## 9. 关键页面事件清单：离职后可直接背
+
+### 首页 `src/pages/index/index.tsx`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `首页用户中心按钮` | 点击左上角用户中心 | 分析用户是否进入个人中心 |
+| `首页扫码按钮` | 点击扫一扫取货 | 扫码入口漏斗起点 |
+| `首页取件码取货按钮` | 点击取件码取货 | 取件码入口漏斗起点 |
+| `首页不同意隐私协议` | 隐私更新弹窗取消 | 合规弹窗流失 |
+| `首页同意隐私协议` | 隐私更新弹窗确认 | 合规确认 |
+| `打开首页隐私协议` | 点击协议链接 | 协议阅读行为 |
+
+### 登录页 `src/pages/login/index.tsx`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `手机号授权登录` | 微信手机号快捷登录 | 授权登录入口 |
+| `其他手机号登录` | 跳验证码登录 | 备用登录入口 |
+
+### 手机号登录页 `src/pages/phone/index.tsx`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `获取验证码` | 点击发送验证码 | 短信验证码漏斗 |
+| `获取验证码登录` | 点击登录按钮 | 登录动作 |
+| `login_verify_code` | 调用验证码登录前 | 带手机号参数的登录方式记录 |
+
+### 货单列表页 `src/pages/orderList/index.tsx`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `货单列表返回首页` | 点击返回 | 区分消息入口和普通返回 |
+| `货单列表一件全开` | 点击一键全开 | 批量开箱动作 |
+| `货单列表完成取件` | 点击完成取件 | 完成取件入口 |
+| `货单列表跳转详情` | 点击货单卡片 | 列表到详情转化 |
+| `货单列表开门取货` | 点击单个订单开门 | 单订单开箱 |
+| `货单列表开格口` | 点击格口 | 单格口开箱 |
+| `货单列表取消完成取件` | 完成弹窗取消 | 完成动作中断 |
+| `货单列表确认完成取件` | 完成弹窗确认 | 最终完成动作 |
+| `货单列表取消接收下一次取货提醒` | 订阅弹窗取消 | 订阅流失 |
+| `货单列表确认接收下一次取货提醒` | 订阅弹窗确认 | 订阅动作 |
+
+### 订单详情页 `src/pages/orderDetail/index.tsx`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `订单详情页联系发货人` | 点击电话图标 | 问题处理/联系行为 |
+| `订单详情页复制取件码` | 点击复制 | 用户保存取件码 |
+| `订单详情开格口` | 点击格口 | 详情页单格口开箱 |
+| `订单详情一键全开` | 点击一键全开 | 详情页批量开箱 |
+| `订单详情完成取件` | 点击完成取件 | 详情页完成入口 |
+| `订单详情取消完成取件` | 完成弹窗取消 | 完成中断 |
+| `订单详情确认完成取件` | 完成弹窗确认 | 完成闭环 |
+| `订单详情取消接收下一次取货提醒` | 订阅弹窗取消 | 订阅流失 |
+| `订单详情确认接收下一次取货提醒` | 订阅弹窗确认 | 订阅动作 |
+
+### 个人中心 `src/pages/profile`
+
+| 事件 | 触发点 | 业务意义 |
+| --- | --- | --- |
+| `查看全部` | 查看全部取货单 | 历史单入口 |
+| `退出登录` | 退出按钮 | 用户登录态结束 |
+| `个人中心跳转详情` | 点击历史货单 | 历史链路到详情 |
+| `个人中心联系发货人` | 电话联系 | 历史单问题处理 |
+
+---
+
+## 10. 关键接口清单：面试官问“接口异常怎么定位”时用
+
+| 接口 | 代码函数 | 业务阶段 | 是否带车辆分区 |
+| --- | --- | --- | --- |
+| `/business-proxy/orders/get_by_code` | `getOrderByCode` | 取件码查单 | 否 |
+| `/business-server/order/get_by_phone` | `getOrderByPhone` | 手机号扫码查单 | 是 |
+| `/client-server/send_open_box_with_grid` | `openBox` | 开箱/开格口 | 是 |
+| `/business-server/android/order/status/update` | `updateStatus` | 开箱后更新订单状态为 `PICKED` | 是 |
+| `/business-server/order/get_detail_by_scan_vcode` | `getDetailByScanOrCode` | 24 小时内扫码/取件码详情 | 是 |
+| `/business-server/order/batch_complete_pick` | `batchCompletePick` | 完成取件 | 是 |
+| `/data-server/orders/pick_order/detail` | `getOrderDetail` | 历史详情 | 否 |
+| `/app-server/app/privacyPolicyVersion` | `getPrivacyPolicyVersion` | 隐私协议版本 | 否 |
+| `/admin-server/partition/detail/byVehicle` | `getVehiclePartition` | 查询车辆分区 | 间接相关 |
+
+排障时的关键字段：
+
+1. `vehicleName`：车辆名，决定分区和开箱目标。
+2. `mobileNumber`：扫码手机号查单链路。
+3. `verifyCode`：取件码链路。
+4. `orderIds`：完成取件和状态更新目标。
+5. `gridNos`：开箱格口。
+6. `autoOpen`：区分自动开箱和用户手动开箱。
+7. `X-Partition-Vehicle`：请求分区路由依据。
+8. `errorCode/message`：业务异常定位依据。
+
+---
+
+## 11. 三个典型线上问题：按时间线怎么查
+
+### 问题 A：用户说“我扫了码，没看到货单”
+
+排查时间线：
+
+1. 查用户是否有 `首页扫码按钮` 事件。
+2. 看这个事件第三个参数是否带手机号。
+3. 查是否有 `/business-server/order/get_by_phone` 请求异常。
+4. 看异常类型：
+   - `RequestError`：HTTP/网关问题。
+   - `ServerException`：业务错误，比如查不到、状态不符。
+   - `NetworkException`：网络异常。
+5. 查是否有 `/pages/orderList/index` 页面曝光。
+6. 如果没有列表页曝光，问题发生在“扫码解析/查单/跳转”阶段。
+7. 如果有列表页曝光但列表为空，问题可能发生在列表页二次查单或订单状态过滤。
+
+可以这样说：
+
+> 我会先确认用户有没有触发入口事件，再看是否成功承接到货单列表页。如果入口有、列表页没有，就重点看扫码解析和查单接口；如果列表页有但为空，就看列表页二次查单和订单状态。
+
+### 问题 B：用户说“门没打开”
+
+排查时间线：
+
+1. 查是否点击 `货单列表开门取货`、`货单列表开格口`、`订单详情开格口` 或 `一键全开`。
+2. 查是否触发 `/client-server/send_open_box_with_grid`。
+3. 看请求参数里的 `vehicleName/gridNos/autoOpen` 是否正确。
+4. 查是否带了 `X-Partition-Vehicle`。
+5. 查分区接口 `/admin-server/partition/detail/byVehicle` 是否异常。
+6. 查开箱成功后 `/business-server/android/order/status/update` 是否成功。
+7. 如果开箱成功但状态更新失败，用户可能已经开门，但订单状态没有推进。
+
+可以这样说：
+
+> 开不了门不能只看用户有没有点按钮，要拆成按钮触发、分区路由、开箱接口、状态更新四步。任何一步异常，用户体感都可能是“门没打开”。
+
+### 问题 C：用户说“完成取件失败”
+
+排查时间线：
+
+1. 查是否有 `货单列表完成取件` 或 `订单详情完成取件`。
+2. 查是否有 `确认完成取件`。
+3. 如果只有完成取件，没有确认，说明用户在弹窗取消或没有继续。
+4. 如果有确认，查 `/business-server/order/batch_complete_pick`。
+5. 查 `orderIds` 是否完整。
+6. 查按钮是否受倒计时 `canClick/time` 限制。
+7. 查完成后是否进入订阅消息流程：
+   - `getSetting`
+   - `checkWxMiniappRegisted`
+   - `confirmModal`
+   - `requestSubscribeMessageSuccess/Fail/Complete`
+8. 如果完成接口成功但没有回首页，重点看订阅流程或 `reLaunch`。
+
+可以这样说：
+
+> 完成取件有两个行为节点：点击完成按钮和确认弹窗。真正业务闭环要看 `batch_complete_pick`，后面还可能接订阅提醒流程，所以排查时我会把完成动作和订阅收尾分开看。
+
+---
+
+## 12. 这套体系能支持哪些指标
+
+### 扫码取货漏斗
+
+```text
+首页曝光
+  -> 首页扫码按钮
+  -> get_by_phone 成功
+  -> 货单列表页曝光 type=PHONE
+  -> 开门取货/开格口/一键全开
+  -> updateStatus 成功
+  -> 确认完成取件
+  -> batch_complete_pick 成功
+```
+
+### 取件码取货漏斗
+
+```text
+首页曝光
+  -> 首页取件码取货按钮
+  -> 取件码页曝光
+  -> get_by_code 成功
+  -> 货单列表页曝光 type=CODE
+  -> 开门取货/开格口/一键全开
+  -> updateStatus 成功
+  -> 确认完成取件
+  -> batch_complete_pick 成功
+```
+
+### 异常指标
+
+1. `get_by_phone` 失败率：扫码入口查单质量。
+2. `get_by_code` 失败率：取件码入口质量。
+3. `send_open_box_with_grid` 失败率：开箱链路稳定性。
+4. `status/update` 失败率：订单状态推进稳定性。
+5. `batch_complete_pick` 失败率：完成取件闭环稳定性。
+6. `partition/detail/byVehicle` 失败率：车辆分区服务稳定性。
+7. `requestSubscribeMessageFail` 数量：订阅提醒转化/失败情况。
+
+注意：
+
+> 当前代码里很多成功指标需要通过“接口无异常 + 后续页面/状态变化”推断。如果要做更精确的数据看板，建议补充标准化 success event。
+
+---
+
+## 13. 面试官深挖“你怎么验证”的真实回答
+
+可以说你会按四类验证：
+
+### 1. 页面曝光验证
+
+手动走：首页、登录页、取件码页、货单列表页、详情页、个人中心。
+
+检查：
+
+1. 是否产生 page view。
+2. `router.path` 是否正确。
+3. `router.params` 是否携带 `type/vehicleName/mobileNumber/verifyCode/orderId`。
+4. `_track_from` 是否符合上一个页面。
+
+### 2. 点击埋点验证
+
+逐个点击核心按钮：
+
+1. 首页扫码。
+2. 取件码取货。
+3. 手机号授权登录。
+4. 获取验证码登录。
+5. 开门取货。
+6. 开格口。
+7. 完成取件。
+8. 确认/取消完成。
+9. 订阅提醒确认/取消。
+
+检查：
+
+1. 事件名是否符合文档。
+2. 关键参数是否传入，比如手机号、订单 ID、格口号。
+3. 是否有重复点击导致重复事件。
+
+### 3. 身份验证
+
+两条链路分别验证：
+
+1. 登录后是否有 `identify(userId, userName)`。
+2. 是否记录 `mobileNumber`。
+3. 取件码免登录是否能记录收件人姓名和联系电话。
+
+### 4. 异常验证
+
+构造几类错误：
+
+1. 错误取件码：触发业务失败。
+2. 断网：触发网络异常。
+3. 接口返回 500：触发 HTTP 异常。
+4. 错误车辆/分区：看分区查询或业务接口异常。
+5. 完成取件传错订单 ID：触发业务错误码。
+
+面试可直接背：
+
+> 我不是只看控制台有没有输出，而是按核心链路走查，确认页面、点击、身份和接口异常四类数据都能在同一用户时间线下串起来。
+
+---
+
+## 14. 可以主动承认的不足：显得真实且专业
+
+这些不足不要怕讲，讲出来反而说明你知道边界。
+
+### 1. 事件命名还没有枚举化
+
+当前很多事件是中文字符串：
+
+```ts
+trackClick('货单列表完成取件', '货单列表完成取件');
+```
+
+优点：直观，业务同学也能看懂。
+
+缺点：
+
+1. 容易手误。
+2. 后续重命名会影响报表。
+3. 不方便统一 lint 和类型约束。
+
+优化：
+
+```ts
+enum TrackEvent {
+  OrderListCompletePick = 'order_list_complete_pick',
+  OrderListConfirmCompletePick = 'order_list_confirm_complete_pick',
+}
+```
+
+面试说法：
+
+> 当时为了快速落地和业务可读性，事件名用了中文。后续如果做长期治理，我会抽事件枚举和事件字典，保证命名稳定。
+
+### 2. 敏感字段需要脱敏
+
+当前可能进入埋点/日志的敏感字段：
+
+1. `mobileNumber`
+2. `verifyCode`
+3. `contact`
+4. 部分请求参数 `response.config.data`
+
+优化：
+
+1. 手机号 hash 或中间四位脱敏。
+2. 取件码只上报 hash 或不直接上报。
+3. 请求参数做白名单。
+4. ZEM logger 封装一层 `safeLogger`。
+
+### 3. 成功事件不够标准化
+
+当前：
+
+1. 点击事件较完整。
+2. 异常事件较完整。
+3. 成功事件更多依赖接口返回和后续页面状态推断。
+
+优化：
+
+1. `open_box_success`
+2. `open_box_failed`
+3. `update_status_success`
+4. `complete_pick_success`
+5. `complete_pick_failed`
+
+面试说法：
+
+> 当前版本能支持链路回放和异常排查，但如果要做更精确漏斗，我会补标准化 success/fail 业务事件，减少只靠请求结果推断。
+
+### 4. 取件码确认按钮可补点击事件
+
+当前取件码页确认按钮直接 `onClick={handleConfirm}`，没有像首页按钮一样调用 `useTrackClick`。
+
+优化：
+
+```ts
+trackClick('取件码确认按钮', '取件码确认按钮');
+handleConfirm();
+```
+
+注意：
+
+> 这不影响后续列表、身份和异常串联，但会让取件码输入页的转化漏斗更完整。
+
+### 5. 自动开箱最好补显式埋点
+
+当前自动开箱通过 `autoOpen` 参数和接口请求可推断，但没有单独事件。
+
+优化：
+
+1. `auto_open_box_triggered`
+2. `auto_open_box_success`
+3. `auto_open_box_failed`
+
+价值：
+
+1. 区分用户手动开箱和系统自动开箱。
+2. 更容易分析自动开箱策略是否合理。
+
+---
+
+## 15. 面试 1 分钟加强版
+
+你可以这样讲，比原来的版本更有代码感：
+
+> 我做的是小程序取货链路的前端可观测性建设。这个链路有扫码和取件码两种入口，后面会经历查单、货单列表、开箱、更新订单状态、完成取件和订阅提醒。原来的问题是线上出了“扫码没反应”“开不了门”“完成取件失败”时，很难知道用户走到了哪一步。
+>
+> 我的方案是分层接入。首先在 `tracker/zem.ts` 初始化 ZEM SDK，做环境、版本和生产开关；然后在公共 `PageLayout` 里用 `useDidShow` 自动上报页面曝光，并带 `_track_from`；在首页、登录、货单列表、详情页补关键点击；在 `store/user` 和取件码页分别做登录用户和免登录用户身份绑定；最后在请求底座和业务响应拦截器里统一上报 HTTP 异常、业务异常、网络异常。因为取货请求还依赖车辆分区，我也把 `X-Partition-Vehicle` 分区路由作为排障上下文一起考虑。
+>
+> 最终这套体系能按“用户 -> 页面 -> 操作 -> 接口 -> 错误码”回放链路，也能支持“首页入口 -> 货单列表 -> 开箱 -> 完成取件”的转化漏斗。
+
+---
+
+## 16. 面试 3 分钟加强版
+
+可以按这个结构讲：
+
+### 背景
+
+小程序取货链路以前缺少统一埋点，用户反馈问题时只能靠口述和后端零散日志。比如“开不了门”可能是扫码解析失败、查单失败、车辆分区错误、开箱接口失败、状态更新失败，也可能是完成取件流程被订阅弹窗打断。
+
+### 方案
+
+我把可观测性拆成五层：
+
+1. SDK 初始化层：`zem.ts` 初始化 ZEM，区分 `dev/uat/prod`，记录版本，只在生产构建启用。
+2. 页面访问层：`PageLayout` 通过 `useDidShow` 上报 page view，带路由参数和 `_track_from`。
+3. 关键行为层：首页扫码、取件码入口、登录、开门、开格口、完成取件、订阅提醒都用 `useTrackClick` 或 `logger.info` 记录。
+4. 身份关联层：登录用户用 `userId/userName/mobileNumber`，取件码免登录用户用收件人姓名和联系方式弱关联。
+5. 异常观测层：请求底座处理 HTTP 非 2xx，业务响应拦截器处理 `success/isSuccess` 失败，rejected 分支处理网络异常，并用 `UnknownException` 兜底。
+
+### 业务上下文
+
+这个项目还有一个特殊点：按车辆分区路由。开箱、查单、完成取件都要带 `X-Partition-Vehicle`，请求拦截器会根据车辆查询分区网关并缓存。如果分区错了，用户体感可能就是查不到单或开不了门，所以我把它也作为链路排障的重要上下文。
+
+### 结果
+
+这套体系让团队可以按用户或手机号回查：他进了哪个页面、点了什么按钮、触发了哪个接口、接口是 HTTP 错、业务错还是网络错。同时业务也能看扫码入口和取件码入口到完成取件的漏斗。
+
+### 反思
+
+当前版本已经覆盖主链路，但我也会主动补充三个优化：事件名枚举化、手机号/取件码脱敏、补充标准化成功事件，尤其是自动开箱和完成取件成功事件。
+
+---
+
+## 17. 面试官追问速答补充
+
+### Q：为什么说这是“体系”不是“打点”？
+
+A：因为我不是只在按钮上加事件，而是同时覆盖了页面曝光、关键行为、身份关联、接口异常和业务日志，并且把这些数据按同一个用户和时间线串起来。
+
+### Q：为什么请求层要上报请求参数？
+
+A：因为排障时只有错误码不够，必须知道当时请求的是哪个 URL、哪个 method、哪个车辆、哪些订单、哪些格口。但参数要做白名单和脱敏，避免敏感信息过度上报。
+
+### Q：如果 ZEM SDK 上报失败怎么办？
+
+A：当前异常上报里有 `UnknownException` 兜底，避免上报过程自己的异常影响业务流程。整体原则是埋点不能阻断用户取货。
+
+### Q：为什么取件码页没有登录也能查单？
+
+A：这是业务设计，取件码本身就是免登录取货入口。所以我在取件码查单成功后，用货单里的收件人信息做弱身份绑定。
+
+### Q：为什么完成取件后还要处理订阅提醒？
+
+A：完成取件不是纯粹接口结束，业务上还希望用户订阅下一次取货提醒。所以我记录了订阅设置、是否注册过小程序、确认弹窗和订阅 API 的 success/fail/complete。
+
+### Q：你怎么避免埋点影响业务？
+
+A：埋点本身尽量放公共层和请求层，业务页面只加关键事件。异常上报放在错误处理流程里，不让上报失败阻断业务；像请求层也会继续抛出正常的业务错误，页面照常 toast 或跳转。
+
+### Q：如果用户说开箱成功但页面还显示待取货怎么办？
+
+A：我会重点查 `send_open_box_with_grid` 和 `android/order/status/update` 两个接口。如果开箱接口成功但状态更新失败，就说明物理动作和业务状态不同步。
+
+### Q：如果页面曝光重复怎么办？
+
+A：`useDidShow` 会在每次页面显示时上报，这符合小程序真实曝光定义。如果分析只想看首次进入，可以在报表侧按 session/page 去重，或者后续在前端增加曝光策略参数。
+
+---
+
+## 18. 最后再压缩成简历解释
+
+简历原句：
+
+> 业务埋点体系：针对小程序取货链路缺少可观测性、线上问题定位成本高的问题，建设页面访问、关键操作、用户身份和接口异常的埋点体系，串联扫码、开箱、完成取件等核心流程，支持业务转化分析与异常排查。
+
+面试展开时的核心骨架：
+
+```text
+痛点：
+  取货链路黑盒，问题定位靠口述。
+
+范围：
+  页面访问、关键操作、身份、接口异常、业务日志。
+
+技术：
+  ZEM SDK + ZEMProvider
+  PageLayout + useDidShow
+  useTrackClick
+  identify/logger.info
+  request interceptors
+  X-Partition-Vehicle
+
+链路：
+  首页扫码/取件码
+  -> 查单
+  -> 货单列表/详情
+  -> 开箱
+  -> 更新状态
+  -> 完成取件
+  -> 订阅提醒
+
+价值：
+  转化分析 + 异常排查 + 用户链路回放。
+
+不足：
+  事件枚举化、敏感字段脱敏、标准化 success event。
+```
+
+最稳的一句话：
+
+> 我这块工作的价值不是“加了多少个埋点”，而是把取货链路从黑盒变成了能按用户时间线回放的白盒系统。
