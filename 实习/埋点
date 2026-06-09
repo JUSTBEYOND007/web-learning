@@ -1,0 +1,547 @@
+我先读一下这份复习文档，了解整体结构，再结合代码一步步带你复习。
+
+这份文档很完整。我先把核心代码文件读出来，然后按文档的分层结构一步步带你复习。先从第一层「SDK 初始化」和全局注入开始。
+
+好，代码和文档完全对得上。我们正式开始第一步复习。
+
+---
+
+## 第一层：SDK 初始化与全局注入
+
+这是整个埋点体系的地基，对应文档里的「伪代码 1」。我们看真实代码 `src/tracker/zem.ts`：
+
+```ts
+const isProduction = process.env.NODE_ENV === 'production';
+
+const getEnvironment = (): 'dev' | 'uat' | 'prod' => {
+  if (process.env.NODE_ENV === 'development') return 'dev'
+
+  const { miniProgram } = getAccountInfoSync();
+  if (miniProgram.envVersion === 'develop') return 'dev'
+  if (miniProgram.envVersion === 'trial') return 'uat'
+  return 'prod'
+};
+
+export const zemClient = createZEMClient({
+  appKey: 'mini_pick',
+  environment: getEnvironment(),
+  enable: isProduction,        // 只有生产才真正上报
+  version: getVersion(),
+  debug: getEnvironment() !== 'prod',
+  volcano: { projectId, topicId },
+});
+```
+
+**这一层你要讲清楚三件事（面试官最爱追问的）：**
+
+1. **为什么放全局，不放页面里？** 埋点 SDK 是「应用级能力」。在 `app.tsx` 里用 `<ZEMProvider client={zemClient}>` 包住整个应用，所有页面天然就有埋点上下文，页面里通过 Hook（`useTrackPageView` / `useTrackClick`）直接拿来用，零重复接入。
+    
+2. **`environment` 怎么判断的？** 这里有个细节值得讲：
+    
+    - 先看 Node 构建环境（`process.env.NODE_ENV === 'development'`）→ `dev`
+    - 再看小程序运行时环境 `miniProgram.envVersion`：`develop`(开发版) → dev、`trial`(体验版) → uat、正式版 → prod
+    - 这是「构建期」和「运行期」两个维度的判断，不是只看一个。
+3. **`enable: isProduction` 和 `debug` 的取舍** 只有生产环境 `enable` 才为 true，真正发数据；非 prod 环境 `debug: true` 方便本地看日志但不污染线上报表。这就是文档反复强调的「数据质量控制 / 环境隔离」。
+    
+
+**对应面试话术（文档 Q17）：** 「我在初始化阶段就区分了环境和开关，生产环境才真正启用上报，避免开发调试污染正式数据。」
+
+---
+
+在进入第二层之前，我想确认一下 `src/tracker/index.ts` 的导出结构（`app.tsx` 是从 `./tracker` 引入的），顺便把第二层「页面曝光」的 `PageLayout` 代码读出来。
+
+完全和文档伪代码 2 对应。继续第二层复习。
+
+---
+
+## 第二层：页面访问埋点（PageLayout）
+
+对应文档「伪代码 2」。真实代码 `src/biz-components/PageLayout/index.tsx`：
+
+```ts
+let lastPath: string;   // 模块级变量，跨页面保存"上一个页面路径"
+
+export function PageLayout(props) {
+  const router = useRouter();
+  const trackPageView = useTrackPageView();
+  const tackTitle = typeof title === 'string' ? title : router.path;
+
+  useDidShow(() => {
+    const { $taroTimestamp, ...trackParams } = router.params;  // 剔除噪音字段
+    trackPageView(router.path, tackTitle, {
+      ...trackParams,
+      _track_from: lastPath,    // 来源页面
+    });
+    lastPath = router.path;     // 更新来源，给下一个页面用
+  });
+  ...
+}
+```
+
+**这一层有四个考点，逐个拆：**
+
+1. **为什么用 `useDidShow` 而不是 `useEffect`？（最高频追问）** 小程序的页面生命周期和 React Web 不同。从详情页「返回」到列表页时，列表页**不会重新挂载**（`useEffect` 不触发），但它会重新「显示」。`useDidShow` 对应小程序的 `onShow`，每次页面真正曝光都触发，埋的才是「真实曝光」。用 `useEffect` 会漏掉大量返回场景的 PV。
+    
+2. **`_track_from` 是怎么实现来源追踪的？** 注意 `lastPath` 是写在组件函数**外面**的模块级变量。它在每次曝光上报后，被赋值为当前页路径。下一个页面曝光时，读到的 `lastPath` 就是上一个页面 → 这就串起了「从哪来」。这是做漏斗和路径回放的关键字段。
+    
+3. **为什么要 `omit($taroTimestamp)`？** Taro 会在路由参数里塞一个时间戳 `$taroTimestamp`，每次都不一样。如果直接上报，埋点参数会被这种噪音污染，没法按参数分群（比如按 `type=PHONE` / `type=CODE` 聚合）。所以先解构剔除掉。
+    
+4. **横切能力为什么沉到公共容器？（文档设计思考 1）** 页面曝光是典型的「横切关注点」。沉到 `PageLayout` 后：字段统一、新页面零成本接入、不会漏埋、公共上下文（来源页、参数）统一治理。业务页面只要用 `PageLayout` 包一层就自动有了曝光埋点。
+    
+
+**面试话术（文档 Q3）：** 「页面曝光放 `useDidShow` 是因为小程序返回页面通常不是重新挂载而是重新显示，`useEffect` 会漏记真实曝光。」
+
+---
+
+这里有个值得你注意的点：`trackPageView(path, title, params)` 这个 Hook 来自 `@zelostech/zem-react`，所以页面曝光实际是调 SDK 提供的能力，不是自研。这跟文档「不要说自研了埋点平台」的边界一致。
+
+要不要我们继续看第三层「点击埋点」？我想先看一个真实页面（首页）是怎么用 `useTrackClick` 的，把抽象的 Hook 落到具体业务上。
+
+好，首页代码非常典型。继续第三层复习。
+
+---
+
+## 第三层：关键操作埋点（useTrackClick）
+
+对应文档「关键操作埋点 → 首页」那一节。先看 Hook 用法模式，以首页为例：
+
+```ts
+const trackClick = useTrackClick();   // 来自 @zelostech/zem-react
+
+// 用户中心按钮
+onClick={() => {
+  trackClick('首页用户中心按钮', '首页用户中心按钮');
+  handleProfileClick();
+}}
+
+// 扫码按钮（注意第三个参数）
+onClick={async () => {
+  trackClick('首页扫码按钮', '首页扫码按钮', String(mobileNumber));
+  handleScan(mobileNumber);
+}}
+
+// 取件码入口
+onClick={() => {
+  trackClick('首页取件码取货按钮', '首页取件码取货按钮');
+  navigateTo({ url: '/pages/code/index' });
+}}
+```
+
+**这一层的几个要点：**
+
+1. **埋点和业务动作解耦的写法** 统一模式都是「先 `trackClick(...)`，再执行业务函数」。埋点只负责记录意图，不参与业务逻辑，互不干扰。即使埋点失败也不影响业务（这点和异常层兜底呼应）。
+    
+2. **`trackClick(event, title, extra?)` 的三个参数**
+    
+    - 第一个：事件标识（如 `首页扫码按钮`）
+    - 第二个：事件标题/描述
+    - 第三个：可选附加信息。注意扫码按钮带了 `String(mobileNumber)` —— 这能区分「已登录点扫码」和「未登录点扫码」两种情况，因为 `handleScan` 里正是用有没有手机号来判断走扫码还是走登录页。
+3. **首页是漏斗的「入口层」** 文档漏斗分析里 `step1` 就是「点击首页扫码按钮」。首页这两个入口（扫码 / 取件码）的点击量对比，就能回答文档价值分析里的问题：「首页两个入口谁更有效？」
+    
+4. **连隐私协议弹窗都埋了** `首页同意隐私协议` / `首页不同意隐私协议` / `打开首页隐私协议`。这体现「关键决策点」也要观测 —— 不同意会直接 `exitMiniProgram` 退出，是个流失点。
+    
+
+**你要注意的一个事实细节（对应文档"不要乱说"）：** 首页扫码后调 `getOrderByPhone` 拿货单，成功才 `navigateTo` 到 `orderList`。但这里**并没有显式埋一个「扫码成功」事件** —— 成功是通过「货单列表页曝光」间接体现的。这正是文档提醒的：「很多成功是通过请求成功和页面状态变化推断，不要说做了完整成功事件闭环」。
+
+---
+
+下一步我建议看第四层「身份绑定」，这是文档反复强调的「可观测性的关键」。涉及两个场景：登录用户（`store/user.ts`）和取件码免登录用户（`pages/code/index.tsx`）。两个文件一起读。
+
+完美，两个身份绑定场景都看到了。继续第四层复习。
+
+---
+
+## 第四层：用户身份埋点（identify）
+
+这是文档反复强调的「整个可观测性的关键」—— 没有身份，页面和错误日志只是匿名噪音。代码里有**两个场景**，对应文档「伪代码 3」。
+
+### 场景一：登录用户（强身份）
+
+在 `src/store/user.ts` 的 `handleLoginSuccess`：
+
+```ts
+handleLoginSuccess: async () => {
+  set({ isLoading: true, error: null });
+  try {
+    const [user] = await Promise.all([getCurrentUser()]);  // 关键：拿业务用户资料
+    zemClient.identify({
+      userId: user.id,
+      userName: user.username,
+    });
+    zemClient.logger.info('mobileNumber', {
+      mobileNumber: user.mobileNumber,   // 手机号单独作为日志补充
+    });
+    set({ user, isAuthenticated: true, ... });
+  } ...
+}
+```
+
+### 场景二：取件码免登录用户（弱身份）
+
+在 `src/pages/code/index.tsx` 的 `handleConfirm`：
+
+```ts
+const res = await getOrderByCode(verifyCode);
+// ...拿到货单后
+zemClient.identify({
+  userId: '',                                       // 没有 userId
+  userName: res?.dispatch?.orderList?.[0]?.name,    // 用收件人姓名
+});
+zemClient.logger.info('mobileNumber', {
+  mobileNumber: res?.dispatch?.orderList?.[0]?.contact,  // 用联系电话
+});
+```
+
+**这一层的核心考点：**
+
+1. **为什么 `identify` 不放在登录接口成功时，而放在 `getCurrentUser()` 之后？（文档伪代码 3 追问）** 登录接口返回的只是「认证成功 + token」，不一定带完整业务资料。`getCurrentUser()` 成功后才能拿到稳定的业务 `user.id` 和 `username`，避免错误绑定或绑定到空值。这就是为什么代码里 `identify` 紧跟在 `await getCurrentUser()` 后面。
+    
+2. **为什么免登录场景也要绑身份？（文档 Q6 / 设计思考 4）** 取件码取货本身就是免登录链路。如果不补身份，**恰恰是最关键的链路变成匿名黑盒**。所以用收件人 `name` + `contact` 做「弱身份」—— `userId` 为空，但靠姓名和电话也能回查到具体的人。
+    
+3. **`identify` 和 `logger.info('mobileNumber')` 为什么分开？** `identify` 是 SDK 的身份绑定 API，把后续所有事件都挂到这个用户身上。手机号是敏感字段，单独用 `logger.info` 作为一条日志补充上去，便于按手机号检索（文档排障时常用「按用户或手机号回放」）。
+    
+4. **事件驱动的设计（值得讲的工程细节）** 注意 `store/user.ts` 底部的 `setupSSOEventListeners`：`ssoManager.on('login', ...)` 监听 SSO 登录事件 → 触发 `handleLoginSuccess` → 才执行 identify。身份绑定不是页面手动调的，而是挂在登录态变化的事件上，保证任何登录入口（快捷登录/验证码登录）成功都会自动绑定。
+    
+
+**面试话术（亮点句 4）：** 「我在方案里同时考虑了登录和免登录两条入口，因为取件码链路如果不补身份，很容易变成匿名黑盒。」
+
+---
+
+⚠️ 顺便提醒一个文档里也点到的「优化意识」点：这里手机号、取件码、收件人姓名都明文进了埋点上下文。面试时你可以主动补一句「如果往更严格合规走，我会对手机号、取件码做 hash 或脱敏，用白名单控制可上报字段」—— 这会显得有安全意识。
+
+---
+
+接下来是最有技术含量的第五层「异常上报」。这是分四类的核心。我把请求底座和业务拦截器两个文件读出来。
+
+这是技术含量最高的一层。继续第五层复习。
+
+---
+
+## 第五层：异常上报（四类分层）
+
+对应文档「伪代码 4」和「异常埋点」。核心思想是 **HTTP 错误 ≠ 业务错误**，所以拆成四类，分别在两个文件里上报。
+
+### 第 1 类：HTTP 非 2xx —— `RequestError`（底层 `lib/request/request.ts`）
+
+在最底层的 `Request.request()` 里，拿到响应先检查状态码：
+
+```ts
+if (response.statusCode < 200 || response.statusCode >= 300) {
+  zemClient.exceptionReporter.report(    // 先上报
+    new RequestError(
+      response?.data?.error_description || response?.data?.error,
+      response.statusCode,
+      response,
+      mergedConfig,
+    ),
+  );
+  throw new RequestError(...);            // 再抛出
+}
+```
+
+注意这里的设计：**先 report，再 throw**。上报不影响异常继续向上抛，业务层照样能 catch。`RequestError` 类里还封装了 `isServerError()` / `isClientError()` / `isTimeoutError()` 等判断方法，上报时带上 `statusCode / url / method`。
+
+### 第 2 类：业务失败 —— `ServerException`（业务层 `api/request.ts` 的 `fulfilled`）
+
+这是文档最强调的一点。HTTP 是 200，但业务字段不成立：
+
+```ts
+fulfilled: (response) => {
+  const { success, isSuccess, data, message: msg, errorCode } = response.data;
+  if (success || isSuccess) {
+    return data;        // 业务成功，直接返回 data
+  }
+  // ...先处理几个特殊错误码 (COM2001 二次确认、DISPATCH_IS_FOR_TRANSPORT 跳转)...
+
+  showToast({ title: msg, icon: 'none' });
+  zemClient.exceptionReporter.report(
+    new ServerException({
+      message: msg,
+      code: errorCode,          // 业务错误码
+      url, method,
+      extra: { data: response.config?.data, ... },
+    }),
+  );
+  return Promise.reject(new ServerError(msg, errorCode, response.data));
+}
+```
+
+**关键点：** 判断标准是业务字段 `success || isSuccess`，不满足就上报 `ServerException`，带上**业务错误码** `errorCode`。如果只看 HTTP 状态码，这类「200 但失败」的问题会全部漏掉 —— 比如库存不足、状态不允许、参数不合法。
+
+### 第 3 类：网络异常 —— `NetworkException`（`api/request.ts` 的 `rejected`）
+
+```ts
+rejected: (error, config) => {
+  // 已经是 ServerError/NetworkError 就直接透传，避免重复上报
+  if (error instanceof ServerError || error instanceof NetworkError) {
+    return Promise.reject(error);
+  }
+  try {
+    zemClient.exceptionReporter.report(
+      new NetworkException({
+        message: error.message ?? error.errMsg,
+        code: error.code,
+        url: config.url, method: config.method,
+        extra: { data: config.data, status: error.response?.status, ... },
+      }),
+    );
+  } catch (e) {
+    // 第 4 类：埋点上报自身的异常兜底
+    zemClient.exceptionReporter.report(new UnknownException(e));
+  }
+  // ...归一化成 NetworkError 再抛...
+}
+```
+
+### 第 4 类：未知异常 —— `UnknownException`（兜底）
+
+就是上面 `catch (e)` 里的那一层。连「上报这个动作本身都失败了」也要兜底记录，保证可观测系统自己不会变成黑洞。
+
+---
+
+**这一层你要讲透的几个考点：**
+
+1. **为什么要在请求层统一做，而不是每个接口 try/catch？（文档 Q 必问）** 异常上报是「基础设施能力」。统一放在请求底座 + 响应拦截器，保证：覆盖率 100%、字段规范一致（URL/method/code/data 全都有）、业务代码只关心成功逻辑、不用每页复制粘贴。
+    
+2. **为什么分四类？（文档设计思考 3）** 线上最常见就是「HTTP 200 但业务失败」。只看网络层会漏掉真实问题。四类分开能精确定位失败发生在哪个阶段：是网关挂了（RequestError）、业务拒绝（ServerException）、还是断网（NetworkException）。
+    
+3. **`rejected` 里的去重判断（值得讲的细节）** `if (error instanceof ServerError || error instanceof NetworkError) return reject(error)` —— 因为 `fulfilled` 里业务失败已经 reject 出 `ServerError` 并上报过 `ServerException` 了，这里要避免它流到 `rejected` 被当成网络异常**二次上报**。这是个容易被追问的「为什么不会重复埋」的点。
+    
+4. **两层文件的分工**
+    
+    - `lib/request/request.ts`：通用 HTTP 库，只管协议层（statusCode），上报 `RequestError`。
+    - `api/request.ts`：业务层拦截器，管业务语义（success/errorCode）和网络兜底，上报 `ServerException` / `NetworkException` / `UnknownException`。 分层清晰，底层库可复用，业务规则在上层。
+
+**面试话术（文档解释）：** 「我把异常拆成 HTTP 非 2xx、业务失败、网络失败、未知失败四类分别上报，因为很多业务失败发生在 HTTP 200 的情况下，只看网络层会漏掉真正的问题。」
+
+---
+
+我注意到 `fulfilled` 里还藏着两个**业务日志**埋点（`showModal` 的 confirm true/false），对应文档「自定义业务日志」那一节。我们等会儿讲业务日志时回头看。
+
+下一步看第六层：你简历里很有亮点的「车辆分区动态路由」，它跟链路真实性强相关。读 `lib/partition`。
+
+好，分区路由代码看到了，比文档伪代码还多了一些细节。继续第六层。
+
+---
+
+## 第六层：车辆分区动态路由（链路真实性保障）
+
+对应文档「伪代码 5」。这层**不是埋点 SDK 本身**，但和排障强相关，是你简历里能体现「有业务理解」的亮点。代码 `src/lib/partition/index.ts`：
+
+```ts
+const vehiclePartitionCache = new Map<string, Promise<Partition | null>>();
+export const VEHICLE_HEADER = 'X-Partition-Vehicle';
+
+function createPartitionInterceptor(requestInstance) {
+  return {
+    fulfilled: async (config) => {
+      const vehicleName = config.headers[VEHICLE_HEADER];
+      if (vehicleName) {
+        const partitionUrl = await getVehiclePartitionUrl(vehicleName);
+        if (!partitionUrl) return config;
+        config.baseURL = `https://${partitionUrl}`;   // 动态改写网关
+      }
+      return config;
+    },
+  };
+}
+```
+
+**为什么需要它？** 这个业务不是所有车都打同一个网关，而是按车辆分区动态路由。请求带上 `X-Partition-Vehicle` 头，拦截器在**请求发出前**根据车辆名查到所属分区的 `gatewayHost`，改写 `baseURL`。如果路由错了，会出现：查不到货单、开不了箱、状态更新失败 —— 这些恰恰是埋点要排查的问题。所以分区错误会直接让「埋点和真实问题都失真」。
+
+**这层代码比文档伪代码更值得讲的两个工程细节：**
+
+1. **缓存的是 Promise，不是结果（防并发击穿）**
+    
+    ```ts
+    const vehiclePartitionCache = new Map<string, Promise<Partition | null>>();
+    ```
+    
+    注意 Map 的 value 类型是 `Promise<Partition | null>`，缓存的是「请求的 Promise」而不是「请求的结果」。这样如果同一辆车的多个请求几乎同时发出，第一个发起查询后，后面的会**复用同一个进行中的 Promise**，不会重复打 `partition/detail/byVehicle` 接口。这是比「缓存结果」更细的并发优化。
+    
+2. **失败时主动清缓存（防错误结果固化）**
+    
+    ```ts
+    partitionPromise = getVehiclePartition(vehicleName).catch(error => {
+      vehiclePartitionCache.delete(vehicleName);  // 失败就删掉
+      throw error;
+    });
+    ```
+    
+    如果查分区失败了，要把这个失败的 Promise 从缓存删掉，否则下次还会拿到这个已 reject 的 Promise，错误被「缓存固化」。
+    
+3. **为什么首页/取件码页每次都 `clearVehiclePartitionCache()`？** 还记得首页 `getList` 和取件码页 `handleConfirm` 开头都调了 `clearVehiclePartitionCache()` 吗？因为用户可能换一辆车扫码，旧的分区缓存要清掉，避免新车命中旧分区。这是「链路上下文正确性」的主动保障。
+    
+
+**面试话术（亮点句 5）：** 「我不仅关注埋点有没有发出去，还关注上下文是否正确，比如车辆分区路由会直接影响链路数据的真实性。如果请求路由错了，链路数据本身就会失真。」
+
+---
+
+接下来看第七层「开箱链路编排」(`useOpenBox.ts`) 和货单列表页的关键操作埋点 + 业务日志。这是链路的「核心动作层」。一起读。
+
+这是链路的核心动作层，内容很丰富。继续第七层。
+
+---
+
+## 第七层：开箱链路编排 + 货单列表核心动作
+
+### 7.1 开箱编排（`useOpenBox.ts`）—— 对应文档伪代码 6
+
+核心思想：**用户操作 ≠ 业务完成**。「开箱」实际是两步组合动作：
+
+```ts
+const handleOpenBox = async (vehicleName, gridNos, orderIds, atuoOpen) => {
+  try {
+    start();                                      // 1. 开始倒计时
+    await doOpenBox(vehicleName, gridNos, atuoOpen);  // 2. 调开箱接口 openBox
+    await doUpdateStatus(vehicleName, orderIds);      // 3. 更新货单状态 updateStatus
+  } catch (error) { ... }
+};
+```
+
+**这里要讲清楚：** 一次「开门取货」点击，背后是 `openBox`（开箱）+ `updateStatus`（状态更新）两个接口顺序执行。所以面试时不要把「点了开门取货」说成「取货完成」—— 它是组合动作，且任何一步失败都会被请求层的异常埋点捕获。
+
+注意代码里有个细节：`doOpenBox` 失败时会 `stop()` 停掉倒计时。倒计时（`useTimeStore`）控制着「取货完成」按钮的可点性 —— 这就是文档排查问题 3 里说的「完成取件按钮被倒计时限制」。
+
+**面试话术（文档 Q「怎么定义关键节点」）：** 「我不是只埋用户点击，而是按业务状态推进定义节点。开箱至少包含操作触发和后端状态更新两层，完成取件则要到 `batch_complete_pick` 成功才算闭环。」
+
+### 7.2 货单列表关键操作埋点
+
+文档列的 10 个事件全在这个文件里，对照着看：
+
+|事件|触发位置|
+|---|---|
+|`货单列表返回首页`|左上角返回|
+|`货单列表完成取件`|底部「取货完成」按钮|
+|`货单列表一件全开`|底部「全部取货」按钮 → `handleOpenAll`|
+|`货单列表跳转详情`|点击 Card（带 `String(order.id)`）|
+|`货单列表开门取货`|单个货单的「开门取货」按钮|
+|`货单列表开格口`|点击 `GridBox`（带格口号）|
+|`货单列表取消/确认完成取件`|第一个 ConfirmModal|
+|`货单列表取消/确认接收下一次取货提醒`|第二个 ConfirmModal|
+
+**注意 `e.stopPropagation()` 的细节：** 开门取货、开格口按钮里都调了 `e.stopPropagation(); e.preventDefault();`。因为这些按钮嵌在「跳转详情」的 Card 里，不阻止冒泡的话点开门会同时触发跳转详情，埋点也会误报两个事件。这是个体现「埋点要和真实交互对齐」的细节。
+
+### 7.3 自定义业务日志（文档「自定义业务日志」节）
+
+这一页是业务日志最密集的地方，这些是比「点击/异常」更高价值的**业务决策点**：
+
+1. **`getSetting`** —— 用 `useDidShow` 进页面就记录用户的订阅消息授权状态（两个模板 ID 的开关）。后面是否弹「接收下次提醒」就靠它。
+    
+    ```ts
+    zemClient.logger.info('getSetting', { [CODE_TEMP_ID]:..., [VEHICLE_TEMP_ID]:..., page: '货单列表页' });
+    ```
+    
+2. **`checkWxMiniappRegisted`** —— 记录用户是否注册过小程序。
+    
+    ```ts
+    zemClient.logger.info('checkWxMiniappRegisted', { isRegisted, page: '货单列表页' });
+    ```
+    
+3. **`confirmModal`** —— 完成取件后，记录是否需要展示「是否接收下次提醒」弹窗（条件 `registed && shouldHandleConfirm`）。
+    
+4. **`requestSubscribeMessageSuccess / Fail / Complete`** —— 订阅消息申请的完整结果（success/fail/complete 三个回调都埋）。注意 `confirmed: 'always'`（记住了上次选择）和 `confirmed: true`（本次手动确认）两种区分。
+    
+
+**为什么这些日志有价值？** 文档说得好：让链路不只停留在「点了没点」，而能覆盖关键业务决策点。比如订阅弹窗流程中断会影响完成取件的收尾（文档排查问题 3 第 5 条）。
+
+---
+
+链路在这里形成闭环：完成取件调 `batchCompletePick`（文档漏斗的 `step5: batch_complete_pick`）。最后看订单详情页 `orderDetail/index.tsx`，把详情链路也补齐,然后我给你做整体串联总结。
+
+订单详情页和货单列表页结构高度对称。完成最后一层复习。
+
+---
+
+## 第八层：订单详情页（详情链路）
+
+详情页结构和货单列表页几乎对称，文档列的详情页 9 个埋点都在这：
+
+|事件|位置|
+|---|---|
+|`订单详情页联系发货人`|电话图标 / MISSPICK 时的按钮（注意埋了两处）|
+|`订单详情页复制取件码`|「复制」按钮 → `handleCopy`|
+|`订单详情开格口`|`GridBox` 点击（带格口号）|
+|`订单详情开门取货`|底部按钮（文档写「一键全开」，代码实际事件名是 `订单详情开门取货`）|
+|`订单详情取消/确认完成取件`|第一个 ConfirmModal|
+|`订单详情取消/确认接收下一次取货提醒`|第二个 ConfirmModal|
+
+业务日志（`getSetting` / `checkWxMiniappRegisted` / `confirmModal` / `requestSubscribeMessage*`）和列表页完全一致，只是 `page: '订单详情页'`。
+
+**详情页比列表页多的两个值得讲的点：**
+
+1. **「自动开箱」的真实实现（呼应文档优化点 3）**
+    
+    ```ts
+    useEffect(() => {
+      if ((detail?.businessStatus === 'ATSTOP' || 'ARRIVEHOME') && vehicleName) {
+        const notPicked = detail?.orderInfo?.orderStatus === 'WAITPICK';
+        if (notPicked) handleOpenBox(vehicleName, grids, [id], true);  // autoOpen=true
+      }
+    }, [detail, vehicleName]);
+    ```
+    
+    车辆到站（`ATSTOP`）且货单待取（`WAITPICK`）时自动开箱。注意这里**没有独立的 `auto_open_box_triggered` 事件**，自动开箱是通过 `handleOpenBox` 的请求和状态体现的。这正是文档优化点 3 说的「自动开箱可以抽象成显式业务事件」——你面试时可以主动提这个改进方向。
+    
+2. **倒计时控制按钮可点性** 底部按钮 `disabled={isOnTheWay || !canClick}`，文案 `开门取货(${time})`。`canClick` 来自 `useOpenBox` 里的 `useTimeStore`。这就是文档排查问题 3 第 4 条「因为倒计时未结束导致按钮不可点」的代码证据。
+    
+
+---
+
+# 整体串联：把八层串成一条可回放的链路
+
+现在所有代码都过完了，我帮你把文档的「方案总览」分层模型对应到真实代码，这是面试时画架构、讲串联的核心：
+
+```
+用户操作
+  → 页面曝光      PageLayout (useDidShow + _track_from)        [第2层]
+  → 点击埋点      useTrackClick (首页/列表/详情)                [第3层]
+  → 身份绑定      identify + logger.info('mobileNumber')        [第4层]
+                  ├ 登录: store/user.ts handleLoginSuccess
+                  └ 免登录: pages/code/index.tsx handleConfirm
+  → 请求发起      Request / requestWithoutAuth                  [第1层初始化]
+  → 分区路由      X-Partition-Vehicle (lib/partition)           [第6层]
+  → HTTP 异常     RequestError   (lib/request/request.ts)       [第5层]
+  → 业务异常      ServerException (api/request.ts fulfilled)    [第5层]
+  → 网络异常      NetworkException (api/request.ts rejected)    [第5层]
+  → 未知异常      UnknownException (兜底)                        [第5层]
+  → 业务日志      logger.info (getSetting/订阅/confirmModal)    [第7层]
+  → 开箱编排      useOpenBox (openBox + updateStatus)           [第7层]
+```
+
+**这套设计的灵魂（面试一定要强调）：** 埋点不是写死在单个页面，而是分别沉到 **5 个稳定位置** —— 全局初始化(app.tsx)、页面容器(PageLayout)、用户状态层(store/user.ts)、请求底座(两个 request.ts)、业务页关键动作。这就是「低侵入 + 高覆盖 + 易复用」。
+
+---
+
+## 复习收尾：三类高频场景的「代码证据」对照
+
+文档讲了三个排障场景，我把它们对应到刚才看的真实代码，这样你回答时有据可依：
+
+**场景「扫码后没反应」：**
+
+- `首页扫码按钮` 点击 → `index/index.tsx` trackClick
+- 货单列表页曝光 → `PageLayout` useDidShow，params.type=`PHONE`
+- `getOrderByPhone` 报错 → `api/request.ts` 上报 ServerException/NetworkException
+- 分区路由 → `lib/partition` 的 `X-Partition-Vehicle`
+
+**场景「开不了门」：**
+
+- `货单列表开门取货`/`订单详情开格口` 点击
+- `openBox` 报错 → 请求层四类异常
+- `updateStatus` 是否成功 → `useOpenBox` 编排的第二步
+
+**场景「完成取件点了没用」：**
+
+- `确认完成取件` 点击 → `batchCompletePick`
+- 倒计时限制 → `canClick`/`time` (useTimeStore)
+- 订阅流程 → `requestSubscribeMessage*` 三个回调日志
+
+---
+
+八层全部复习完毕，每一层都对上了代码证据。给你三条收尾建议：
+
+1. **讲项目先讲业务问题**（链路不可观测、排障靠人工），再讲技术分层方案，最后讲价值（转化分析 + 异常排查）。
+2. **守住边界**：是「基于 ZEM SDK 做业务落地」不是「自研埋点平台」；很多「成功」是靠请求成功+页面状态推断，不是每步都有独立 success event;没有真实报表就不要编百分比。
+3. **主动抛 2 个优化点加分**：事件命名枚举化、敏感字段（手机号/取件码）脱敏、自动开箱抽象成显式事件。
+
+需要我针对哪一层做更深入的模拟追问，或者帮你把某段代码整理成可以直接背诵的「3分钟讲稿」吗？
