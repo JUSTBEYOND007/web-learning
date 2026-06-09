@@ -1,0 +1,1170 @@
+# 简历第一点补充深挖：发车任务创建 / 任务节点建模
+
+> 目标：这份文档是离职后看不到代码时的“项目记忆备份”。重点不是把每行代码背下来，而是把面试会追问的业务背景、状态模型、交互链路、接口参数、技术取舍和坑点讲清楚。
+>
+> 对应简历点：任务节点建模：针对发车任务配置流程复杂、节点类型多且状态分散的问题，抽象“途经点 / 揽收点 / 返程点”统一任务节点模型，支持站点拖拽排序、先派 / 先揽切换、返程停靠配置与 ETA 回填联动，提升复杂配置场景下的表单可维护性与交互一致性。
+
+---
+
+## 0. 一句话项目定位
+
+这是无人车 H5 里的“新建发车任务”页面。用户在地图上为某辆无人车配置任务路线：选择途经 / 派送点、可选揽收点、返程停靠点，前端实时请求算路预览并回填 ETA，最后通过滑动按钮创建发车任务，轮询调度系统拿到成功状态后跳转到任务进行中页面。
+
+核心代码：
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| 发车主页面 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/index.tsx` | 状态编排、站点选择、算路、发车、轮询、跳转 |
+| 拖拽列表 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/draggable-stopover-list.tsx` | 基于 `react-sortable-hoc` 的站点拖拽 / 删除 |
+| 返程停靠卡片 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/components/ReturnStopCard.tsx` | 返程点展示、自动规则提示、手动修改入口 |
+| 确认发车页 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/components/DepartureConfirmSection.tsx` | 车辆信息卡片 + 滑动发车按钮 + 取消任务 |
+| 跑圈次数控件 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/components/LoopCountControl.tsx` | `dispatchType=loop` 时展示循环次数 |
+| 任务进行中页 | `src/pages/UnmannedVehicleNew/Vehicle/TaskProgress/index.tsx` | 发车成功后独立页面，刷新后能恢复任务状态 |
+| 路线步骤适配器 | `src/pages/UnmannedVehicleNew/components/VehicleDetail/vehicleInfoCard.adapter.ts` | 把静态站点 / 运输节点转换成 UI 时间线 |
+| 服务接口 | `src/services/unmannedVehicleNew/index.ts` | `/dispatch/preview`、`/transport/dispatch`、`/transport/dispatch/status` 等 |
+| 类型定义 | `src/services/unmannedVehicleNew/types.ts` | `StopOverPointType`、`StopOverPointInfo`、任务状态枚举 |
+| 跨页状态 | `src/pages/UnmannedVehicleNew/atoms.ts` | Jotai atom，缓存站点和通知列表刷新 |
+
+---
+
+## 1. 面试版讲法
+
+### 1.1 30 秒版本
+
+我负责无人车 H5 的新建发车任务流程。这个页面的难点是任务配置不是普通表单，而是“站点选择 + 地图算路 + 拖拽排序 + 返程规则 + 发车调度轮询”的组合流程。我把站点统一抽象成 `StopOverPointInfo`，再用三段式数组 `[派送/途经点[], 揽收点[], 返程点[]]` 管理不同类型节点，前端基于这个结构驱动列表展示、拖拽排序、算路参数组装和确认页路线渲染。算路接口返回后会过滤不可达站点并回填 ETA，发车后通过 `while + await` 串行轮询调度结果，成功后跳到独立任务进行中页，解决刷新丢状态的问题。
+
+### 1.2 3 分钟版本
+
+业务上，站点有三类：派送 / 途经点、揽收点、返程停靠点。它们都属于任务路线节点，但交互规则不同：派送和揽收可以选多个、排序、整体切换先后；返程点通常来自规则自动填入，也允许用户手动修改，但必须固定在路线末尾。为避免多个独立 state 互相不同步，我设计了一个三段式二维数组 `stopoverPointListArray`，把异构节点放到同一个数据模型里。
+
+页面运行时有三份关键状态：`stopoverPointListArray` 负责结构化分段；`selectedStations` 是 Jotai atom 里的扁平数组，供跨组件共享；`edit` 是本地数组，作为触发算路 `useEffect` 的依赖。用户选择站点、拖拽排序、切换先派 / 先揽后，都会同步更新这三份状态，从而保证地图、表单和确认页看到的是同一条路线。
+
+算路时，前端把派送 / 揽收点按当前顺序拼好，再把返程点追加到 `utpAutoportIds`，调用 `/dispatch/preview`。接口返回后，我把 `planPath` 转为地图能画的 `LINESTRING`，把站点坐标转成 `POINT`，同时把 `estimateArriveTime` 格式化成 `HH:mm 预计到达` 回填到站点节点里。因为算路 useEffect 不能直接依赖整个二维数组，否则容易造成循环触发，我用了 `stopoverPointListArrayRef` 保证异步回调拿到最新返程点，同时用 `edit` 控制重算时机。
+
+发车阶段先组装 `/transport/dispatch` 参数，核心是 `transportParam.targetAutoports`，每个站点带 `utpAutoportId` 和 `targetIntent`，派送类映射 `WaybillPost`，揽收类映射 `WaybillPick`，返程点放到 `returnToHubParam.parking`。创建接口只返回 requestId，不代表车辆真正启动，所以我写了串行轮询 `pollWifiInfo`，每 500ms 查一次 `/transport/dispatch/status`，最多 15 次，状态 2 成功、3 失败。成功后写入 Jotai 成功标记，并通过 `history.replace` 跳转到 `TaskProgress` 独立页，URL 带 `transportId`，刷新后还能通过接口恢复运输详情和路线进度。
+
+---
+
+## 2. 业务复杂度：为什么这不是普通表单
+
+发车任务配置页同时处理三类复杂度：
+
+1. 节点类型复杂：同一个路线里包含派送 / 途经、揽收、返程停靠。类型不同，但都要参与路线展示和发车参数。
+2. 节点状态分散：列表展示用站点名称，地图用 WKT / 经纬度，调度接口用 `utpAutoportId`，确认页用 ETA，任务进行中页用 `recordStatus`。
+3. 交互联动复杂：选择站点后要算路；拖拽后要重算路；返程点自动规则和手动选择要互斥；确认页可以返回修改；发车成功后要跨页面刷新状态。
+
+所以真正的难点是“把散在 UI、地图和接口里的站点概念统一起来”，这也是简历里“任务节点建模”的含义。
+
+---
+
+## 3. 核心数据模型
+
+### 3.1 统一节点类型
+
+类型定义在 `src/services/unmannedVehicleNew/types.ts`：
+
+```ts
+export enum StopOverPointType {
+  START_POINT = 'START_POINT',
+  POST_POINT = 'POST_POINT',
+  THIRD_POST_POINT = 'THIRD_POST_POINT',
+  PICK_POINT = 'PICK_POINT',
+  END_POINT = 'END_POINT',
+  EXCHANGE_PACKAGE = 'EXCHANGE_PACKAGE',
+}
+
+export interface StopOverPointInfo {
+  eta?: string;
+  type: string;
+  staId: string | number;
+  staName: string;
+  lineType?: string;
+  parkingSpotId?: number;
+  utpAutoportId?: number;
+}
+```
+
+这里的设计重点：
+
+- `type` 解决“这个点是干什么的”：派送、揽收、返程。
+- `staId` 解决“前端选择器里的站点 id”。
+- `utpAutoportId / parkingSpotId / lineType` 解决“调度和返程停车参数”。
+- `eta` 是前端算路回填字段，不是用户选择时天然存在的。
+
+### 3.2 三段式数组
+
+主页面里的核心 state：
+
+```ts
+const [stopoverPointListArray, setStopoverPointListArray] = useState<
+  StopOverPointInfo[][]
+>([]);
+
+const defaultEndPoint: StopOverPointInfo[] = [
+  {
+    staId: 'endPoint',
+    staName: '按规则找车位',
+    type: StopOverPointType.END_POINT,
+  },
+];
+
+const [endPointList, setEndPointList] =
+  useState<StopOverPointInfo[]>(defaultEndPoint);
+```
+
+三段含义：
+
+```txt
+stopoverPointListArray[0] -> 第一段任务点：默认是派送 / 途经点
+stopoverPointListArray[1] -> 第二段任务点：默认是揽收点
+stopoverPointListArray[2] -> 返程停靠点：固定在最后
+```
+
+为什么用二维数组：
+
+- 分段信息天然存在：派送、揽收、返程的交互规则不同。
+- 最终接口又需要扁平顺序：发车时要拼成 `targetAutoports`。
+- 切换先派 / 先揽时，只需要交换前两段，不影响返程段。
+- 确认页、地图、任务进度页可以复用同一个结构。
+
+### 3.3 旁路状态：为什么不只保留一个 state
+
+主页面里同时维护：
+
+```ts
+const [selectedStations, setSelectedStations] = useAtom(selectedStationAtoms);
+const [edit, setEdit] = useState<StopOverPointInfo[]>();
+const [stopoverPointListArray, setStopoverPointListArray] = useState<StopOverPointInfo[][]>([]);
+```
+
+三者职责不同：
+
+| 状态 | 类型 | 职责 |
+|------|------|------|
+| `stopoverPointListArray` | 二维数组 | 页面主模型，保留派送 / 揽收 / 返程分段 |
+| `selectedStations` | Jotai 扁平数组 | 跨组件共享，站点选择器和地图页都能读取 |
+| `edit` | 本地扁平数组 | 作为算路 effect 的触发器，选择 / 删除 / 拖拽后更新 |
+
+面试可以这样解释：我没有把所有状态都混在一个全局 atom 里，而是按职责拆分。结构化数据留在页面本地，跨组件共享只暴露扁平数组，算路触发用更小的依赖，降低无关更新导致的副作用。
+
+---
+
+## 4. 初始化：返程停靠点自动规则
+
+页面进入后，如果是单程往返任务，会查询返程停靠规则：
+
+```ts
+queryStopRuleInfo({ businessAreaId, settingKey: 6 }).then((res) => {
+  const settingValue = res?.data?.settingValue;
+  const rule = settingValue?.rules?.[0];
+  const staId = rule?.utpAutoportId || rule?.parkingSpotId;
+
+  if (!rule?.staName || !staId) {
+    setEndPointList(defaultEndPoint);
+    setStopoverPointListArray([[], [], defaultEndPoint]);
+    return;
+  }
+
+  const lastPoint: StopOverPointInfo[] = [{
+    staName: rule.staName,
+    lineType: rule.lineType,
+    utpAutoportId: rule.utpAutoportId,
+    parkingSpotId: rule.parkingSpotId,
+    type: StopOverPointType.END_POINT,
+    staId,
+  }];
+
+  setEndPointList(lastPoint);
+  setStopoverPointListArray([[], [], lastPoint]);
+});
+```
+
+这里有几个业务细节很适合面试讲：
+
+- 返程点不是用户必选项，优先从业务规则自动填入。
+- 接口返回结构是 `settingValue.rules[]`，默认取第一条规则。
+- 如果规则缺字段，就用 `defaultEndPoint` 占位，文案是“按规则找车位”。
+- 确认发车按钮会判断返程点不能还是 `staId === 'endPoint'` 的占位值。
+
+确认按钮禁用逻辑：
+
+```ts
+const isConfirmDisabled = isEmpty(
+  selectedStations?.filter(
+    (item) => item?.type !== StopOverPointType.END_POINT
+  )
+) || isEmpty(
+  stopoverPointListArray[2]?.filter(
+    (item) => item?.staId && item.staId !== 'endPoint'
+  )
+);
+```
+
+这保证了至少有一个任务点，并且返程点是一个真实停靠点。
+
+---
+
+## 5. 站点选择：从抽屉回写三段式数组
+
+站点选择器是 `ChooseStationDrawer`。用户选择完成后，根据 `chooseType` 写入不同段：
+
+```ts
+onChange={(data, v) => {
+  if (chooseType === 'start') {
+    const arr = [...stopoverPointListArray];
+    arr[0] = data;
+    const newArr = arr.flat();
+    setSelectedStations(() => newArr);
+    setEdit(newArr);
+  } else if (chooseType === 'pick') {
+    const arr = [...stopoverPointListArray];
+    arr[1] = data;
+    const newArr = arr.flat();
+    setSelectedStations(() => newArr);
+    setEdit(newArr);
+  } else if (chooseType === 'backPoint') {
+    const arr = [...stopoverPointListArray];
+    arr[2] = data;
+    const newArr = arr.flat();
+    setEndPointList(data);
+    setStopoverPointListArray(arr);
+    setIsEndPointUserChanged(true);
+    setSelectedStations(() => newArr);
+    setEdit(newArr);
+  }
+  setChooseVisible(v);
+}}
+```
+
+注意点：
+
+- `start` 和 `pick` 分别写入 `[0]`、`[1]`。
+- `backPoint` 写入 `[2]`，同时更新 `endPointList` 和 `isEndPointUserChanged`。
+- 每次都把二维数组 `flat()` 成 `newArr`，同步给 `selectedStations` 和 `edit`。
+
+可以主动讲的坑：这段代码里 `start / pick` 分支没有显式调用 `setStopoverPointListArray(arr)`，但后续算路成功后会重新 `setStopoverPointListArray([postStaList, pickStaList, finalBackStaList])` 回填。返程点必须立即更新二维数组，因为算路参数要读取最新返程点。
+
+---
+
+## 6. 拖拽排序：局部列表和全局下标
+
+### 6.1 拖拽组件结构
+
+拖拽组件使用 `react-sortable-hoc`：
+
+```ts
+export const DraggableStopoverItem = SortableElement(
+  (props: DraggableStopoverItemProps) => { ... }
+);
+
+export const DraggableStopoverList = SortableContainer(
+  (props: DraggableStopoverListProps) => {
+    const { disable, startIndex, dataArray, edit, leastOne } = props;
+    return (
+      <div className={b('station-list')}>
+        {dataArray?.map((o, index) => (
+          <DraggableStopoverItem
+            key={`item-${o.staId}`}
+            index={startIndex + index}
+            keyIndex={startIndex + index}
+            startIndex={startIndex}
+            dataArray={dataArray}
+            staInfo={o}
+            disabled={disable}
+            onChangeStation={async (v) => {
+              edit(v);
+            }}
+            leastOne={leastOne}
+          />
+        ))}
+      </div>
+    );
+  }
+);
+```
+
+关键是 `index={startIndex + index}`。因为一个页面可能渲染多个列表，`react-sortable-hoc` 的排序事件拿到的是全局 index。如果每段都从 0 开始，拖拽事件会定位错。
+
+### 6.2 删除为什么要 `keyIndex - startIndex`
+
+单个站点删除：
+
+```ts
+const tmp = dataArray.slice();
+tmp.splice(keyIndex - startIndex, 1);
+onChangeStation(tmp);
+```
+
+`keyIndex` 是全局下标，比如第二段第一个站点可能是 3；但 `dataArray` 是当前段数组，它自己的下标从 0 开始。所以要减去 `startIndex` 得到段内相对下标。
+
+### 6.3 拖拽结束后同步状态
+
+主页面的 `onSortEnd`：
+
+```ts
+const onSortEnd = ({ oldIndex, newIndex }) => {
+  let newarray;
+  setSelectedStations((t) => {
+    newarray = arrayMoveImmutable(t, oldIndex, newIndex);
+    setSelectedStations(newarray);
+    setEdit(newarray);
+    return newarray;
+  });
+  const postStaList = newarray.filter(item => item.type === 'POST_POINT');
+  const pickStaList = newarray.filter(item => item.type === 'PICK_POINT');
+  isDeliveryFirst
+    ? setStopoverPointListArray([postStaList, pickStaList, stopoverPointListArray[2]])
+    : setStopoverPointListArray([pickStaList, postStaList, stopoverPointListArray[2]]);
+};
+```
+
+这里的思路：
+
+- 用 `arrayMoveImmutable` 在扁平数组里移动元素。
+- 更新 `selectedStations`，保证共享状态正确。
+- 更新 `edit`，触发算路重新预览。
+- 再按 `type` 重新拆回 `postStaList / pickStaList`。
+- 返程段 `[2]` 保持不变。
+
+当前代码事实：`ReturnStopCard` 现在把返程点作为单独卡片展示，返程点不再和任务点一起拖拽排序；这是更符合业务的，因为返程点必须固定在最后。
+
+---
+
+## 7. 先派 / 先揽切换
+
+代码保留了 `handleToggleSequence`：
+
+```ts
+const handleToggleSequence = () => {
+  if (loading) return;
+  setIsDeliveryFirst((prev) => !prev);
+
+  const deliveryPoints = stopoverPointListArray[0] || [];
+  const pickupPoints = stopoverPointListArray[1] || [];
+  const endPoints = stopoverPointListArray[2] || [];
+
+  if (pickupPoints.length || deliveryPoints.length) {
+    setLoading(true);
+  }
+
+  const newArray = isDeliveryFirst
+    ? [[...pickupPoints], [...deliveryPoints], [...endPoints]]
+    : [[...deliveryPoints], [...pickupPoints], [...endPoints]];
+
+  setStopoverPointListArray(newArray);
+  const newSelectedStations = newArray.flat().filter((item) => item);
+  setSelectedStations(newSelectedStations);
+  setEdit(newSelectedStations);
+};
+```
+
+这段可以讲两个点：
+
+1. `setIsDeliveryFirst` 是异步的，所以当前函数里的 `isDeliveryFirst` 仍然是旧值。旧值为 true 说明当前是先派后揽，点击后要变成先揽后派，所以新数组要把 pickup 放前面。
+2. 切换后更新 `edit`，让算路重新计算 ETA 和轨迹。
+
+当前代码事实：页面里展示这个切换入口的 JSX 被注释了，说明当前版本设计稿暂时隐藏了先派 / 先揽切换 UI，但底层模型仍支持前两段交换。面试时可以说“这个能力在数据模型上支持过，当前版本按产品设计隐藏入口”。
+
+---
+
+## 8. 算路预览：地图轨迹 + ETA 回填
+
+### 8.1 为什么用 `stopoverPointListArrayRef`
+
+代码里有：
+
+```ts
+const stopoverPointListArrayRef = useRef(stopoverPointListArray);
+useEffect(() => {
+  stopoverPointListArrayRef.current = stopoverPointListArray;
+}, [stopoverPointListArray]);
+```
+
+算路 `useEffect` 的依赖是：
+
+```ts
+}, [employeeId, vehicleId, vehicleSelectedBackPoint, edit, selectedCarCnt]);
+```
+
+它没有直接依赖 `stopoverPointListArray`，而是通过 ref 读取最新返程点。原因：
+
+- 如果 effect 依赖整个二维数组，算路成功后又 `setStopoverPointListArray`，容易形成重复触发。
+- 但接口参数又必须拿到最新返程点，所以用 ref 保证异步回调读到最新值。
+- 真正触发重算的是 `edit`，也就是用户选择 / 删除 / 拖拽后的扁平路线变化。
+
+这是一处很值得讲的 React 实战经验：用 ref 解决“需要最新值，但不希望它成为 effect 依赖”的场景。
+
+### 8.2 算路接口参数
+
+算路调用：
+
+```ts
+getTrajectoryInfo({
+  businessAreaId,
+  deliveryAutoPortBuildingType: ["STATION", "PICKUPPOINT", "THIRDPOST"],
+  udid,
+  utpAutoportIds: [
+    ...stations.map(item => Number(item.staId)),
+    ...(stopoverPointListArrayRef.current[2]
+      ?.map(item => Number(item?.utpAutoportId))
+      .filter(Boolean) ?? [])
+  ],
+  needPlanRoute: true,
+  needPreviewReturn: true,
+  returnToHubParam: {
+    parking: stopoverPointListArrayRef.current[2]?.length ? {
+      lineType: stopoverPointListArrayRef.current[2][0]?.lineType,
+      utpAutoportId: stopoverPointListArrayRef.current[2][0]?.utpAutoportId,
+      parkingSpotId: stopoverPointListArrayRef.current[2][0]?.parkingSpotId
+    } : {}
+  }
+});
+```
+
+参数含义：
+
+| 参数 | 含义 |
+|------|------|
+| `deliveryAutoPortBuildingType` | 支持站点、揽收点、三方派送点 |
+| `utpAutoportIds` | 任务点 id + 返程停靠点 id |
+| `needPlanRoute` | 要求后端返回可绘制路线 |
+| `needPreviewReturn` | 要求预览返程路线 |
+| `returnToHubParam.parking` | 指定返程停靠位置 |
+
+### 8.3 接口返回后的处理
+
+核心处理步骤：
+
+```ts
+const utpAutoportPlans = res?.data?.utpAutoportPlans || [];
+
+const routes = utpAutoportPlans
+  .filter(item => item?.planPath?.length > 0)
+  .map(item => {
+    return {
+      path: `LINESTRING(${item.planPath
+        .map(subItem => `${subItem?.lng} ${subItem?.lat}`)
+        .join(',')})`
+    };
+  });
+```
+
+地图需要的是 WKT 格式，所以把后端返回的经纬度点串成 `LINESTRING(lng lat,lng lat)`。
+
+站点点位和 ETA：
+
+```ts
+const validStaPoints = utpAutoportPlans
+  .slice(0, -1)
+  .filter(item => item?.utpAutoportLoc?.lng && item?.utpAutoportLoc?.lat)
+  .map((item) => {
+    const estimateArriveTime = formatLocalClock(item?.estimateArriveTime);
+    return {
+      staId: item?.utpAutoportId,
+      eta: estimateArriveTime ? `${estimateArriveTime}预计到达` : '',
+      wkt: `POINT(${item.utpAutoportLoc.lng} ${item.utpAutoportLoc.lat})`,
+      status: 0,
+      type: "POST_POINT"
+    };
+  });
+```
+
+回填站点列表时，会把不可达站点过滤掉：
+
+```ts
+const processStopoverItem = (item, plans) => {
+  const obj = plans.find(subItem => +subItem?.utpAutoportId === +item.staId);
+  if (!obj) return null;
+
+  const estimateArriveTime = formatLocalClock(obj?.estimateArriveTime);
+  const eta = estimateArriveTime ? `${estimateArriveTime}预计到达` : '';
+
+  return {
+    ...item,
+    title: item.staName,
+    type: item.type,
+    eta
+  };
+};
+```
+
+业务含义：如果用户选了某个站点，但算路结果里没有对应 `utpAutoportId`，说明这个点不在有效路线计划里，前端不会继续把它展示到任务节点里，避免确认页和地图不一致。
+
+### 8.4 返程点兜底
+
+返程点处理：
+
+```ts
+const backStaList = [];
+stopoverPointListArrayRef.current[2].forEach(item => {
+  const obj = utpAutoportPlans.find(
+    subItem => +subItem?.utpAutoportId === +item.utpAutoportId
+  );
+  if (!obj) return;
+  const estimateArriveTime = formatLocalClock(obj?.estimateArriveTime);
+  backStaList.push({
+    ...item,
+    title: item?.staName,
+    type: item.type,
+    eta: estimateArriveTime ? `${estimateArriveTime}预计到达` : '',
+  });
+});
+
+const finalBackStaList = backStaList.length > 0 ? backStaList : endPointList;
+setStopoverPointListArray([postStaList, pickStaList, finalBackStaList]);
+setEndPointList(finalBackStaList);
+```
+
+这里的细节是：如果算路没匹配到返程点，不直接清空返程点，而是保留 `endPointList` 作为兜底。否则用户会遇到“刚才看到有返程点，算路失败后突然没了”的体验问题。
+
+---
+
+## 9. 确认页：从配置态切到提交态
+
+点击“确认发车信息”后：
+
+```ts
+const toDeparture = () => {
+  setVehicleDetailInfo(null);
+  getVechicledetail(true);
+  setShowPointBubble(true);
+  setShowDeparture(true);
+};
+```
+
+页面分两阶段：
+
+```txt
+showDeparture = false -> 地图 + 规划任务抽屉 + 确认发车信息按钮
+showDeparture = true  -> 地图 + 车辆详情确认页 + 滑动开始任务
+```
+
+确认页拆成了 `DepartureConfirmSection`：
+
+```tsx
+<DepartureConfirmSection
+  vehicleDetailInfo={vehicleDetailInfo}
+  newTitle={newTitle}
+  stopoverPointListArray={stopoverPointListArray}
+  estimatedinfo={estimatedinfo}
+  isDepartureSuccess={isDepartureSuccess}
+  sliderDisabled={sliderDisabled}
+  toCreateRecord={toCreateRecord}
+  businessAreaId={businessAreaId}
+  udid={udid}
+  history={history}
+  onGoBackEdit={() => setShowDeparture(false)}
+/>
+```
+
+好处：
+
+- 主页面只负责流程状态，确认页 UI 独立维护。
+- `onGoBackEdit` 可以让用户返回规划页修改，数据不会丢。
+- `VehicleDetail` 复用同一个 `stopoverPointListArray` 渲染路线时间线。
+
+还有一个移动端兼容细节：确认按钮用 Portal 挂到 `document.body`：
+
+```tsx
+ReactDOM.createPortal(
+  <div className="confirm-departure-footer">
+    <CnButton ...>确认发车信息</CnButton>
+  </div>,
+  document.body
+)
+```
+
+代码注释写得很清楚：这是为了避免 iOS WebView 中 `fixed` 被 `CnPage / 地图容器` 错误锚定。面试可以说这是移动端 H5 里处理 fixed footer 的一个实践。
+
+---
+
+## 10. 滑动发车：防误触交互
+
+滑动按钮在 `src/pages/UnmannedVehicleNew/components/sliderRightButton/index.tsx`。
+
+核心逻辑：
+
+```ts
+const handleTouchStart = (e) => {
+  if (isDisabled) return;
+  const event = e.targetTouches[0];
+  diff.current =
+    event.clientX - thumbRef.current.getBoundingClientRect().left;
+  sliderRef.current.addEventListener('touchend', handleTouchEnd);
+  sliderRef.current.addEventListener('touchmove', handleTouchMove);
+};
+```
+
+移动中计算滑块位置：
+
+```ts
+let newX =
+  event.clientX -
+  diff.current -
+  sliderRef.current.getBoundingClientRect().left;
+
+if (newX < start) newX = start;
+if (newX > end) newX = end - 8;
+
+thumbRef.current.style.left = `${newX}px`;
+thumbWrapperRef.current.style.width = `${thumbWrapperWidth}px`;
+```
+
+到达阈值才触发 action：
+
+```ts
+if (Math.trunc(thumbWrapperWidth) >= Math.trunc(sliderRefWidth) - 50) {
+  setIsDispath(true);
+  if (action) {
+    action()
+      .then((res) => {
+        if (res) {
+          successAction && successAction(res);
+          sliderInit();
+        } else {
+          failedAction && failedAction();
+          sliderInit();
+        }
+      })
+      .catch((error) => {
+        failedAction && failedAction();
+        setErrorMsg(error?.errorMsg || error || errorText);
+        sliderInit();
+      });
+  }
+}
+```
+
+这类按钮适合无人车发车这种高风险动作：不是点一下就提交，而是要求用户完成一个明确的滑动动作，降低误触概率。
+
+---
+
+## 11. 发车参数组装
+
+`toCreateRecord` 是发车主流程。
+
+### 11.1 参数结构
+
+```ts
+const obj = {
+  businessAreaId,
+  deliveryAutoPortBuildingType: ["STATION", "PICKUPPOINT", "THIRDPOST"],
+  operateType: "Transport",
+  transportParam: {
+    parcelNum: ordCnt,
+    fileList: fileList?.map(item => item?.ossKey),
+    returnToHubParam: {
+      parking: stopoverPointListArray[2] && stopoverPointListArray[2].length ? {
+        lineType: stopoverPointListArray[2][0]?.lineType,
+        utpAutoportId: stopoverPointListArray[2][0]?.utpAutoportId,
+        parkingSpotId: stopoverPointListArray[2][0]?.parkingSpotId
+      } : null
+    },
+    needReturn: true,
+    targetAutoports: (
+      isDeliveryFirst
+        ? [...stopoverPointListArray[0], ...stopoverPointListArray[1]]
+        : [...stopoverPointListArray[1], ...stopoverPointListArray[0]]
+    )?.map(item => ({
+      utpAutoportId: item.staId,
+      businessInputParkingParam: {},
+      targetIntent: ['POST_POINT', 'STATION', 'THIRDPOST'].includes(item?.type)
+        ? 'WaybillPost'
+        : 'WaybillPick'
+    }))
+  },
+  udid,
+  dispatchType: dispatchType === 'loop' ? '' : 'UTP_AUTO_PORT_DISPATCH',
+  utpAutoPortDispatchVOList: null,
+};
+```
+
+核心转换关系：
+
+| 前端节点 | 发车参数 |
+|----------|----------|
+| 派送点 `POST_POINT` | `targetIntent: 'WaybillPost'` |
+| 三方派送点 `THIRDPOST` | `targetIntent: 'WaybillPost'` |
+| 揽收点 `PICK_POINT` | `targetIntent: 'WaybillPick'` |
+| 返程点 `END_POINT` | `returnToHubParam.parking` |
+
+### 11.2 非 loop 场景补充 dispatch 列表
+
+```ts
+if (dispatchType !== 'loop') {
+  const targetList = obj.transportParam.targetAutoports
+    ?.map(item => ({ utpAutoportId: item.utpAutoportId })) || [];
+  const backPointList = (stopoverPointListArray[2] || [])
+    .filter(item => item?.utpAutoportId)
+    .map(item => ({ utpAutoportId: item.utpAutoportId }));
+  obj.utpAutoPortDispatchVOList = [...targetList, ...backPointList];
+}
+```
+
+这个字段更像是给调度侧的完整停靠点列表：任务点 + 返程点。这样后端既能拿到业务意图 `targetAutoports`，也能拿到完整调度点序列。
+
+### 11.3 创建接口不等于成功
+
+调用：
+
+```ts
+const createRes = await createRecordNew(obj);
+if (!createRes?.data?.dispatchRequestResult?.requestId ||
+  (createRes?.data?.dispatchRequestResult?.requestId &&
+    (String(createRes?.data?.dispatchRequestResult?.detectPass) === 'false' ||
+      String(createRes?.data?.dispatchRequestResult?.accept) === 'false'))) {
+  CnMessage.show({
+    content: createRes?.data?.dispatchRequestResult?.errorMsg || '发车失败'
+  });
+  return;
+}
+```
+
+判断条件：
+
+- 没有 `requestId`：创建失败。
+- `detectPass === false`：前置检测不通过。
+- `accept === false`：调度系统不接受。
+
+只有 requestId 存在且检测 / 接受都不为 false，才继续轮询调度状态。
+
+---
+
+## 12. 串行轮询调度结果
+
+轮询函数：
+
+```ts
+const pollWifiInfo = async ({
+  udid,
+  businessAreaId,
+  deliveryAutoPortBuildingType,
+  requestId,
+  interval = 300,
+  maxAttempts = 10
+}) => {
+  let attemptCount = 0;
+  let result = null;
+
+  while (attemptCount < maxAttempts && !result) {
+    try {
+      const res = await queryDispatchStatus({
+        udid,
+        businessAreaId,
+        deliveryAutoPortBuildingType,
+        requestId,
+      });
+
+      if (
+        res?.data &&
+        [2, 3].includes(+res?.data?.nasaOpenAutotransDispatchMsg?.status)
+      ) {
+        result = res.data;
+      }
+    } catch (error) {
+      console.error(`第 ${attemptCount + 1} 次请求失败`, error?.errorMsg);
+    }
+
+    attemptCount++;
+    if (!result) {
+      await new Promise(resolve => setTimeout(resolve, interval));
+    }
+  }
+
+  if (!result || result?.nasaOpenAutotransDispatchMsg?.status === 3) {
+    throw new Error(`发车失败`);
+  }
+
+  return result;
+};
+```
+
+发车时传的是：
+
+```ts
+interval: 500,
+maxAttempts: 15
+```
+
+也就是最多等待约 7.5 秒。
+
+为什么不用 `setInterval`：
+
+- `setInterval` 不关心上一次请求是否结束，网络慢时容易堆积请求。
+- `while + await` 是串行的，请求完成后再等待下一次，更符合调度查询场景。
+- 成功 / 失败状态都可以作为终态退出，错误统一交给外层 catch。
+
+状态含义：
+
+| status | 含义 | 前端处理 |
+|--------|------|----------|
+| 2 | 调度成功 | 展示成功 Toast，跳任务进行中页 |
+| 3 | 调度失败 | `pollWifiInfo` 抛错，外层展示失败 |
+| 其他 | 处理中 | 继续轮询直到超过次数 |
+
+---
+
+## 13. 发车成功后的跨页状态
+
+成功后：
+
+```ts
+setVehicleKeyPoint(prev => ({
+  ...prev,
+  vehicleCreateType: 'customizeRoute',
+  vehicleCreateSuccess: Date.now()
+}));
+
+setVehicleCreateMapRecordSuccessAtoms(map => {
+  const newMap = new Map(map);
+  newMap.set(vehicleId, true);
+  return newMap;
+});
+
+const _transportId = dispatchStatus.nasaOpenAutotransDispatchMsg?.utpTransportId;
+history.replace(
+  `/UnmannedVehicle/vehicle-task-progress?vehicleId=${vehicleId}&udid=${udid}${_transportId ? `&transportId=${_transportId}` : ''}`
+);
+```
+
+这里做了三件事：
+
+1. 写 `vehicleKeyPointAtoms`，用于记录发车成功时间点 / 类型，可能服务埋点或链路统计。
+2. 写 `vehicleCreateMapRecordSuccessAtoms`，通知车辆列表或详情刷新。
+3. `history.replace` 跳转任务进行中页，避免用户回退又回到发车确认页。
+
+`atoms.ts` 里定义：
+
+```ts
+export const vehicleCreateMapRecordSuccessAtoms = atom<Map<string, boolean>>(
+  new Map()
+);
+```
+
+为什么用 `Map<vehicleId, boolean>`：同一个列表里可能有多辆车，按 `vehicleId` 记录某辆车是否刚发车成功，比一个全局 boolean 更精确。
+
+---
+
+## 14. 为什么要拆 TaskProgress 独立页
+
+交接文档里有背景：原先发车成功后通过 `isDepartureSuccess` 内存状态展示“任务执行中”，页面一刷新状态就丢了。后来改成独立页面：
+
+```txt
+/UnmannedVehicle/vehicle-task-progress?vehicleId=xxx&udid=xxx&transportId=xxx
+```
+
+`TaskProgress` 做的事：
+
+- 进入页面后 `queryVehicleList` 获取车辆当前状态。
+- 如果车辆处于 `DELIVERYING / PICKING / LOADING / RETURN`，调用 `queryTransportDetail`。
+- 用 `transportId` 查询运输详情，拿到轨迹、站点节点、ETA。
+- 5 秒轮询刷新车辆信息和运输详情。
+- 地图气泡根据状态展示“派送中 / 已到达 / 返程中 / 充电中”等。
+
+运输详情转换为任务节点：
+
+```ts
+const fulfillmentTaskNodes: FulfillmentTaskNodeDTO[] = [
+  {
+    stopoverPointDetailInfoDTO: {
+      eta: dispatchTime ? `${dispatchTime} 已出发` : '',
+      staId: businessAreaId,
+      staName: businessAreaTitle || '起点',
+      title: businessAreaTitle,
+      type: "START_POINT",
+    },
+  },
+  ...(transportAutoports.map((item, index) => {
+    const time = getTimeField(item.status);
+    const etaTime = formatLocalClock(item[time]);
+    const actualArriveTime = formatLocalClock(item?.actualArriveTime);
+    return {
+      stopoverPointDetailInfoDTO: {
+        eta: actualArriveTime
+          ? `${actualArriveTime} 已到达`
+          : etaTime ? `${etaTime} ${TransportStatusType[item.status]} ` : '',
+        staId: item?.utpAutoportId,
+        staName: item?.utpAutoportTitle,
+        title: item?.utpAutoportTitle,
+        recordStatus: RecordStatusType[item.status],
+        type: index === transportAutoports.length - 1 ? 'END_POINT' : 'POST_POINT',
+      },
+    };
+  })),
+];
+```
+
+这个设计把“创建任务时的静态路线”和“任务执行后的动态路线”统一到了 `FulfillmentTaskNodeDTO` / `StopOverPointInfo` 这一套展示模型里。
+
+---
+
+## 15. 路线时间线：创建前与进行中的两套适配
+
+车辆卡片里：
+
+```ts
+const pendingTaskSteps = buildPendingTaskSteps(stopoverPointListArray);
+const startedTaskSteps = buildStartedTaskSteps(
+  stopoverPointListArray,
+  fulfillmentTaskNodeDTOS,
+  transportInfo
+);
+const routeSteps = isTaskStarted ? startedTaskSteps : pendingTaskSteps;
+```
+
+创建前：
+
+```ts
+const fixedStartPoint = {
+  staId: 'task-start-point',
+  staName: '起点',
+  type: 'START_POINT',
+} as StopOverPointInfo;
+
+const getTaskRoutePoints = (
+  stopoverPointListArray?: StopOverPointInfo[][]
+) => [
+  ...(stopoverPointListArray?.[0] || []),
+  ...(stopoverPointListArray?.[2] || []),
+];
+```
+
+创建前的路线只展示：起点 + 任务点 + 返程点。注意当前适配器只取 `[0]` 和 `[2]`，没有取 `[1]`，这和当前 UI 主要使用“途经点 + 返回停靠点”的版本有关。如果后续重新开放揽收段展示，这里应该补上 `[1]`。
+
+进行中：
+
+```ts
+const buildStartedTaskSteps = (
+  stopoverPointListArray?: StopOverPointInfo[][],
+  fulfillmentTaskNodeDTOS?: FulfillmentTaskNodeDTO[],
+  transportInfo?: TransportDetail
+) => {
+  const merged = getTaskRoutePoints(stopoverPointListArray);
+  const fulfillmentNodes = fulfillmentTaskNodeDTOS || [];
+  const routeSource = merged.length
+    ? [fixedStartPoint, ...merged]
+    : fulfillmentNodes.map((item) => { ... });
+};
+```
+
+进行中优先用已有路线源，如果没有则用后端履约节点兜底，保证刷新页面后也能画出路线。
+
+进度判断逻辑在 `resolveStartedRouteProgress`：
+
+- 找到 `RecordStatus.InProgress`，箭头显示在进行中的节点或上一段连线上。
+- 找不到进行中，就找最后一个 `DONE`。
+- 再根据 ETA 文案里的“已到达 / 预计”兜底。
+- 最后默认箭头在起点。
+
+这属于“把后端状态适配成 UI 状态”的典型工作。
+
+---
+
+## 16. 图片上传和分区图
+
+发车参数里支持传分区图：
+
+```ts
+fileList: fileList?.map(item => item?.ossKey)
+```
+
+上传前先获取 OSS token：
+
+```ts
+getCloudToken({
+  purpose: 'NewAppDepartOss'
+}).then(res => {
+  const ossT = (res as any)?.data?.ossToken || '{}';
+  saveLocalData('oss-token', JSON.stringify(ossT));
+});
+```
+
+选择图片时限制大小：
+
+```ts
+if (file?.size > 10 * 1024 * 1024) {
+  Toast.fail({ content: '图片最大为10mb' });
+  return;
+}
+```
+
+上传前会进入 `ImageEditor`，保存后：
+
+```ts
+const res = await getLocalData('oss-token') || '{}';
+const uploadedFile = await ossFileUpload(
+  JSON.parse(res) as OssUploadPayload,
+  editedFile
+);
+setFileList(fileList.concat(uploadedFile));
+```
+
+面试里除非被问到，不建议把图片上传作为主线讲。它更像发车任务的附属能力：上传货箱分区图，帮助站点卸货识别包裹。
+
+---
+
+## 17. 当前代码里的不足 / 可优化点
+
+这部分很重要。面试被问“还有什么可以优化”时，别说没有。
+
+### 17.1 部分历史能力和当前 UI 不完全一致
+
+`handleToggleSequence` 保留了先派 / 先揽切换逻辑，但 UI 入口被注释。文档或简历里如果写“支持先派 / 先揽切换”，要讲清楚是底层模型支持，当前版本入口按设计稿隐藏。
+
+### 17.2 `buildPendingTaskSteps` 当前没有拼 `[1]` 揽收段
+
+路线适配器当前：
+
+```ts
+const getTaskRoutePoints = (...) => [
+  ...(stopoverPointListArray?.[0] || []),
+  ...(stopoverPointListArray?.[2] || []),
+];
+```
+
+如果要完整展示派送 + 揽收 + 返程，应该改成：
+
+```ts
+[
+  ...(stopoverPointListArray?.[0] || []),
+  ...(stopoverPointListArray?.[1] || []),
+  ...(stopoverPointListArray?.[2] || []),
+]
+```
+
+这能作为“我离职前识别到的后续优化点”来讲。
+
+### 17.3 `loopCount` 当前只维护 UI 状态，发车参数未透传
+
+`LoopCountControl` 能增减循环次数，但 `toCreateRecord` 当前没有把 `loopCount` 放进 `transportParam`。如果跑圈模式要真正生效，还需要和后端约定字段并透传。
+
+### 17.4 `onSortEnd` 内部嵌套调用 `setSelectedStations`
+
+当前写法：
+
+```ts
+setSelectedStations((t) => {
+  newarray = arrayMoveImmutable(t, oldIndex, newIndex);
+  setSelectedStations(newarray);
+  setEdit(newarray);
+  return newarray;
+});
+```
+
+这里在 setter 回调里又调用了一次 setter，虽然能运行，但风格不够干净。更推荐：
+
+```ts
+setSelectedStations((prev) => {
+  const next = arrayMoveImmutable(prev, oldIndex, newIndex);
+  setEdit(next);
+  // 同步拆分 stopoverPointListArray 的逻辑可以在这里或外部统一处理
+  return next;
+});
+```
+
+### 17.5 车门二次复检代码有历史痕迹
+
+`checkDoor` 和 `confirmDoorClosed` 都存在，但当前弹窗里的“确认关锁”按钮调用被注释：
+
+```tsx
+onClick={() => {
+  // confirmDoorClosed();
+}}
+```
+
+所以如果面试讲“车门锁双重校验”，要谨慎：可以说“代码里设计过首次进入确认页检测和确认关锁复检两个函数，但当前版本复检按钮调用被注释，实际链路以当前线上逻辑为准”。不要把它讲成当前完整闭环。
+
+### 17.6 类型可以更严格
+
+不少地方用了 `string`、`any` 或弱类型，比如 `chooseType: string`、`processStopoverItem(item, plans)`。更好的做法：
+
+- `chooseType` 定义成 `'start' | 'pick' | 'backPoint'`。
+- 后端 `utpAutoportPlans` 定义明确 DTO。
+- `targetIntent` 定义枚举。
+
+---
+
+## 18. 面试高频追问答案
+
+### Q1：为什么不用三个 state：deliveryPoints、pickupPoints、endPoints？
+
+可以，但三段之间有大量联动：拖拽后要合并算路，先派 / 先揽要交换前两段，确认页要统一渲染路线，发车参数要拼成一个顺序数组。如果用三个独立 state，每次操作都要同步维护多个变量，容易漏更新。三段式数组既保留分段语义，又方便 `flat()` 得到发车顺序。
+
+### Q2：`selectedStations` 和 `stopoverPointListArray` 会不会重复？
+
+它们是有意重复，职责不同。`stopoverPointListArray` 是页面的结构化模型；`selectedStations` 是跨组件共享的扁平模型，便于站点选择器和地图消费。每次用户操作都会同步更新，保证 UI 一致。
+
+### Q3：为什么算路 useEffect 不依赖 `stopoverPointListArray`？
+
+因为算路成功后会回写 `stopoverPointListArray`，如果把它作为依赖，可能出现重复触发或循环触发。这里用 `edit` 表示用户编辑动作，用 `stopoverPointListArrayRef` 读取最新返程点，兼顾触发可控和数据新鲜。
+
+### Q4：拖拽为什么要全局下标？
+
+页面里可能有多个拖拽列表。每段列表自己的 index 都从 0 开始，但拖拽库返回的是整个 sortable 上下文里的 index。用 `startIndex + index` 能让每个站点在全局唯一，删除时再用 `keyIndex - startIndex` 转回段内下标。
+
+### Q5：算路接口返回后为什么要过滤没有 `planPath` 的站点？
+
+没有 `planPath` 说明后端没给出可行路线或轨迹数据。如果前端继续展示，会导致列表上有点、地图上没路线、发车参数和用户感知不一致。过滤后能保证地图和任务节点一致。
+
+### Q6：ETA 是前端算的还是后端算的？
+
+ETA 时间来自后端算路 / 运输详情接口，前端只做格式化和文案拼接。创建前来自 `/dispatch/preview` 的 `estimateArriveTime`，进行中来自 `/transport/detail` 的 `estimateArriveTime / actualArriveTime / actualFinishTime`。
+
+### Q7：发车接口返回 requestId 为什么还要轮询？
+
+`/transport/dispatch` 返回 requestId 只代表请求被创建或受理，不代表车辆已经进入调度成功状态。真实结果要查 `/transport/dispatch/status`。所以前端要轮询 status，等到 2 成功或 3 失败。
+
+### Q8：轮询为什么用 `while + await`？
+
+它能保证串行：上一轮请求完成后才等 500ms 发下一轮。`setInterval` 在弱网下可能上一轮没返回下一轮又发出，造成请求堆积和状态乱序。
+
+### Q9：为什么发车成功后用 `history.replace`？
+
+发车是不可逆的高风险动作。成功后不希望用户点返回回到确认发车页重复提交，所以用 replace 替换历史栈。同时跳到独立 TaskProgress 页面，刷新后可以通过 URL 参数重新查任务详情。
+
+### Q10：这个项目你最核心的前端贡献是什么？
+
+不是单纯写页面，而是把复杂的业务节点抽象成统一数据模型，并围绕这个模型打通选择、排序、算路、ETA 回填、发车参数、确认页展示和任务进行中恢复。它让原本分散在表单、地图和接口里的状态变成一条可维护的数据链路。
+
+---
+
+## 19. 可以直接放进简历的优化表述
+
+如果只写一条：
+
+> 负责无人车 H5 新建发车任务流程，抽象三段式任务节点模型 `[任务点[], 揽收点[], 返程点[]]` 统一管理异构站点，打通站点选择、拖拽排序、返程规则自动填入、地图算路预览与 ETA 回填；封装滑动发车与调度结果串行轮询，发车成功后跳转任务进行中页并基于 `transportId` 恢复路线进度，提升复杂发车配置的可维护性和状态一致性。
+
+如果拆成两条：
+
+> 设计发车任务节点模型，将派送 / 揽收 / 返程停靠点统一为 `StopOverPointInfo` 并用三段式数组管理，支持站点选择、拖拽排序、先派 / 先揽顺序切换、返程停靠规则自动填入和手动修改。
+>
+> 联调发车算路与调度链路：调用 `/dispatch/preview` 生成地图轨迹并回填 ETA，组装 `/transport/dispatch` 参数创建任务，基于 `while + await` 实现 500ms × 15 次串行轮询调度结果，成功后携带 `transportId` 跳转任务进行中页，解决刷新后任务状态丢失问题。
+
+---
+
+## 20. 复盘时要记住的关键词
+
+- `StopOverPointInfo`
+- `StopOverPointType`
+- `stopoverPointListArray`
+- `[派送/途经点[], 揽收点[], 返程点[]]`
+- `selectedStationAtoms`
+- `edit` 触发算路
+- `stopoverPointListArrayRef` 防闭包旧值
+- `queryStopRuleInfo(settingKey: 6)`
+- `/dispatch/preview`
+- `LINESTRING / POINT`
+- `estimateArriveTime -> ETA`
+- `react-sortable-hoc`
+- `startIndex + index`
+- `keyIndex - startIndex`
+- `targetIntent: WaybillPost / WaybillPick`
+- `returnToHubParam.parking`
+- `/transport/dispatch`
+- `requestId`
+- `/transport/dispatch/status`
+- `status=2 成功，status=3 失败`
+- `history.replace('/vehicle-task-progress?...transportId=')`
+- `queryTransportDetail`
+- `fulfillmentTaskNodeDTOS`
+
