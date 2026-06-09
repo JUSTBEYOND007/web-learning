@@ -1,0 +1,997 @@
+# 简历第一点：发车任务创建 — 代码巩固手册
+
+  
+
+> 对应简历描述：设计三段式站点数组 `[派送[], 揽收[], 返程[]]` 管理异构站点，结合 `react-sortable-hoc` 实现拖拽排序；实现车门锁双重安全校验与防误触滑动发车；采用 `while + await` 串行异步轮询 NASA 调度系统（15次 × 500ms），替代 `setInterval` 避免请求堆积。
+
+>
+
+> 核心文件：`src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/index.tsx`（1570行）
+
+> 拖拽组件：`src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/draggable-stopover-list.tsx`
+
+  
+
+---
+
+  
+
+## 一、三段式站点数组设计
+
+  
+
+### 1.1 为什么要三段式？
+
+  
+
+发车任务涉及三类性质完全不同的站点：
+
+- **途经/派送点**（POST_POINT）：车辆去派包裹
+
+- **揽收点**（PICK_POINT）：车辆去取包裹
+
+- **返程停靠点**（END_POINT）：任务完成后停回哪里
+
+  
+
+这三类站点的**操作逻辑不同**：
+
+- 前两类支持用户自由增删、拖拽排序，还可以"先派后揽/先揽后派"整体互换
+
+- 返程点**始终固定在最后**，不参与排序，默认由规则自动填入
+
+  
+
+如果用三个独立 `useState` 管理，互换顺序时需要同时调用三次 set，容易不同步。用一个二维数组，操作更原子。
+
+  
+
+### 1.2 数据结构定义
+
+  
+
+```typescript
+
+// index.tsx:152
+
+const [stopoverPointListArray, setStopoverPointListArray] = useState<
+
+StopOverPointInfo[][]
+
+>([]);
+
+  
+
+// 三段含义：
+
+// stopoverPointListArray[0] —— 途经/派送点（先派后揽时在前）
+
+// stopoverPointListArray[1] —— 揽收点（先揽后派时在前）
+
+// stopoverPointListArray[2] —— 返程停靠点（始终最后，独立管理）
+
+  
+
+// 默认返程点（规则接口未返回时兜底）
+
+const defaultEndPoint: StopOverPointInfo[] = [
+
+{
+
+staId: 'endPoint',
+
+staName: '按规则找车位',
+
+type: StopOverPointType.END_POINT,
+
+},
+
+];
+
+```
+
+  
+
+### 1.3 先派后揽 / 先揽后派 切换
+
+  
+
+```typescript
+
+// index.tsx:236 — handleToggleSequence
+
+const handleToggleSequence = () => {
+
+if (loading) return; // 算路中不允许切换
+
+setIsDeliveryFirst((prev) => !prev);
+
+  
+
+const deliveryPoints = stopoverPointListArray[0] || [];
+
+const pickupPoints = stopoverPointListArray[1] || [];
+
+const endPoints = stopoverPointListArray[2] || [];
+
+  
+
+// isDeliveryFirst 此时还是切换前的值（setState 是异步的）
+
+// 所以 isDeliveryFirst=true 代表"当前先派" → 点击后要切换到"先揽"
+
+const newArray = isDeliveryFirst
+
+? [[...pickupPoints], [...deliveryPoints], [...endPoints]] // 切换到先揽后派
+
+: [[...deliveryPoints], [...pickupPoints], [...endPoints]]; // 切换到先派后揽
+
+  
+
+setStopoverPointListArray(newArray);
+
+  
+
+// 同步更新扁平数组（供地图算路、Jotai atom 使用）
+
+const newSelectedStations = newArray.flat().filter((item) => item);
+
+setSelectedStations(newSelectedStations);
+
+setEdit(newSelectedStations); // edit 变化会触发路线重算 useEffect
+
+};
+
+```
+
+  
+
+> **面试要点**：`isDeliveryFirst` 在 `handleToggleSequence` 执行时还是旧值（React setState 异步），所以要用旧值判断"当前状态"来决定切换方向，这是一个常见的闭包陷阱。
+
+  
+
+### 1.4 站点选择后更新三段式数组
+
+  
+
+用户通过抽屉选完站点后，按类型写入对应的段：
+
+  
+
+```typescript
+
+// index.tsx:1150 — ChooseStationDrawer onChange 回调
+
+onChange={(data, v) => {
+
+if (chooseType === 'start') {
+
+// 写入 index 0（途经/派送段）
+
+const arr = [...stopoverPointListArray];
+
+arr[0] = data;
+
+const newArr = arr.flat();
+
+setSelectedStations(() => newArr);
+
+setEdit(newArr);
+
+} else if (chooseType === 'pick') {
+
+// 写入 index 1（揽收段）
+
+const arr = [...stopoverPointListArray];
+
+arr[1] = data;
+
+...
+
+} else if (chooseType === 'backPoint') {
+
+// 写入 index 2（返程段）
+
+const arr = [...stopoverPointListArray];
+
+arr[2] = data;
+
+setEndPointList(data);
+
+setStopoverPointListArray(arr);
+
+setIsEndPointUserChanged(true); // 标记用户手动改过，不再显示"自动填入"副标题
+
+...
+
+}
+
+}}
+
+```
+
+  
+
+---
+
+  
+
+## 二、react-sortable-hoc 拖拽排序
+
+  
+
+### 2.1 组件封装
+
+  
+
+```typescript
+
+// draggable-stopover-list.tsx:42
+
+import { SortableContainer, SortableElement } from 'react-sortable-hoc';
+
+  
+
+// 单个可排序站点项
+
+export const DraggableStopoverItem = SortableElement(
+
+(props: DraggableStopoverItemProps) => {
+
+const { staInfo, dataArray, keyIndex, startIndex, onChangeStation } = props;
+
+  
+
+return (
+
+<div className={b('station-item')} onDragStart={(e) => e.preventDefault()}>
+
+<div className={b('station-item-content')}>
+
+{/* 超过1个站点才显示汉堡拖拽手柄 */}
+
+{dataArray.length > 1 && <CnIcon type="hamburger" size="small" />}
+
+  
+
+<div style={{ fontSize: '14px' }}>
+
+{staInfo.staName}
+
+</div>
+
+  
+
+{/* 返程点和 leastOne 时不显示删除按钮 */}
+
+{staInfo.type === StopOverPointType.END_POINT || leastOne ? (
+
+<div className={b('list-item-none-close-icon-holder')} />
+
+) : (
+
+<CnIcon
+
+type="close"
+
+size="small"
+
+onClick={() => {
+
+const tmp = dataArray.slice();
+
+tmp.splice(keyIndex - startIndex, 1); // 按相对下标删除
+
+onChangeStation(tmp);
+
+}}
+
+/>
+
+)}
+
+</div>
+
+</div>
+
+);
+
+}
+
+);
+
+  
+
+// 可排序列表容器
+
+export const DraggableStopoverList = SortableContainer(
+
+(props: DraggableStopoverListProps) => {
+
+const { disable, startIndex, dataArray, edit } = props;
+
+return (
+
+<div className={b('station-list')}>
+
+{dataArray?.map((o, index) => (
+
+<DraggableStopoverItem
+
+key={`item-${o.staId}`}
+
+index={startIndex + index} // SortableElement 要求的全局下标
+
+keyIndex={startIndex + index}
+
+startIndex={startIndex}
+
+dataArray={dataArray}
+
+staInfo={o}
+
+disabled={disable}
+
+onChangeStation={(v) => edit(v)}
+
+/>
+
+))}
+
+</div>
+
+);
+
+}
+
+);
+
+```
+
+  
+
+### 2.2 拖拽结束回调：同步三处状态
+
+  
+
+```typescript
+
+// index.tsx:625 — onSortEnd
+
+const onSortEnd = ({ oldIndex, newIndex }) => {
+
+let newarray;
+
+  
+
+// 更新扁平数组（setSelectedStations 的回调形式，拿到最新值）
+
+setSelectedStations((t) => {
+
+newarray = arrayMoveImmutable(t, oldIndex, newIndex); // 不可变移动
+
+setSelectedStations(newarray);
+
+setEdit(newarray); // 触发路线规划 useEffect
+
+return newarray;
+
+});
+
+  
+
+// 同步拆分回三段式（保持业务语义）
+
+const postStaList = newarray.filter(item => item.type === 'POST_POINT');
+
+const pickStaList = newarray.filter(item => item.type === 'PICK_POINT');
+
+  
+
+isDeliveryFirst
+
+? setStopoverPointListArray([postStaList, pickStaList, stopoverPointListArray[2]])
+
+: setStopoverPointListArray([pickStaList, postStaList, stopoverPointListArray[2]]);
+
+// 注意：stopoverPointListArray[2]（返程点）始终保持不变
+
+};
+
+```
+
+  
+
+> **面试要点 1**：为什么用 `arrayMoveImmutable` 而不是直接 `splice`？
+
+> 答：`splice` 会修改原数组（mutation），React 状态更新需要新引用才能触发重渲染。`arrayMoveImmutable` 返回新数组，保证不可变性。
+
+  
+
+> **面试要点 2**：`startIndex` 是干什么用的？
+
+> 答：三段式数组对应三个 `DraggableStopoverList`，每个列表内部的 `index` 从 0 开始，但 `react-sortable-hoc` 需要全局唯一下标来定位拖拽位置。`startIndex` = 前面所有段的站点数之和，使得全局下标不重叠。
+
+  
+
+---
+
+  
+
+## 三、车门锁双重安全校验
+
+  
+
+### 3.1 业务背景
+
+  
+
+无人配送车发车前必须确认车门已锁，否则配送途中包裹可能丢失。系统设计了两次校验：
+
+  
+
+| 时机 | 触发条件 | 效果 |
+
+|------|---------|------|
+
+| 第一次 | 用户点击"确认发车信息"进入确认页 | 检测到未锁 → 滑动按钮置灰 + 弹窗警告 |
+
+| 第二次 | 用户在弹窗中点击"已关锁" | 再次检测 → 确认通过才解锁滑动按钮 |
+
+  
+
+### 3.2 两阶段 UI 切换（showDeparture）
+
+  
+
+```typescript
+
+// 第一阶段：规划任务页
+
+{!showDeparture && departureInfoDrawer} // 显示站点选择抽屉
+
+  
+
+// 第二阶段：确认发车页
+
+{showDeparture && (
+
+<DepartureConfirmSection ... /> // 显示发车确认信息
+
+)}
+
+  
+
+// 进入第二阶段的入口
+
+const toDeparture = () => {
+
+setVehicleDetailInfo(null);
+
+getVechicledetail(true); // 刷新车辆实时状态
+
+setShowPointBubble(true);
+
+setShowDeparture(true); // 切换到确认页
+
+checkDoor(); // 同时触发第一次车门检测
+
+};
+
+```
+
+  
+
+### 3.3 第一次检测：进入确认页
+
+  
+
+```typescript
+
+// index.tsx:622 — checkDoor
+
+const checkDoor = () => {
+
+const udid = vehicleId.split('^^^')?.[0] || null;
+
+getDetectDoor({
+
+udid,
+
+newUser: !isOldUser,
+
+firstEnterConfirmPage: true, // 标志位：第一次进入确认页
+
+employeeId,
+
+}).then((res) => {
+
+const { hasLocked, vehicleDetectExceptionLabels } = res.data;
+
+  
+
+if (!hasLocked) {
+
+// 车门未锁：滑动按钮置灰 + 弹出警告弹窗
+
+setSliderDisabled(true);
+
+setShowCheckDialog(true);
+
+setConfirmLabel(labelObject); // 弹窗标题（如"车锁未关闭"）
+
+} else if (!isOldUser && hasLocked && !isEmpty(vehicleDetectExceptionLabels)) {
+
+// 新用户且有异常标签：也弹提示（但不置灰滑动按钮）
+
+setShowCheckDialog(true);
+
+setConfirmLabel(labelObject);
+
+}
+
+// hasLocked=true 且无异常：直接放行，什么都不做
+
+});
+
+};
+
+```
+
+  
+
+### 3.4 第二次检测：用户声称已关锁
+
+  
+
+```typescript
+
+// index.tsx:651 — confirmDoorClosed
+
+const confirmDoorClosed = () => {
+
+const udid = vehicleId.split('^^^')?.[0] || null;
+
+getDetectDoor({
+
+udid,
+
+newUser: !isOldUser,
+
+firstEnterConfirmPage: false, // 标志位：用户手动确认后的二次验证
+
+employeeId,
+
+}).then((res) => {
+
+const { hasLocked } = res.data;
+
+  
+
+if (!hasLocked) {
+
+// 仍未关锁：警告用户，不解锁按钮
+
+CnMessage.warning({
+
+content: '系统校验车锁仍未关闭，请锁好后再发车；关锁异常请联系运维处理',
+
+});
+
+} else {
+
+// 已关锁：解锁滑动按钮
+
+setSliderDisabled(false);
+
+setShowCheckDialog(false);
+
+getVechicledetail(true); // 刷新车辆详情
+
+setDoorHasLocked(true);
+
+}
+
+});
+
+};
+
+```
+
+  
+
+### 3.5 防误触滑动发车组件
+
+  
+
+```typescript
+
+// index.tsx:1237 — 车门未锁时显示置灰的滑动按钮
+
+{showDeparture && !doorHasLocked && (
+
+<CnPageFooter>
+
+<SliderRightButton
+
+action={toCreateRecord} // 滑动到底触发发车
+
+text="向右滑动发车"
+
+isDisabled={sliderDisabled} // true = 按钮置灰，无法操作
+
+successAction={() => {
+
+window.localStorage.setItem('OldUser', 'true');
+
+setTimeout(() => {
+
+history.replace(`/UnmannedVehicle/vehicle-record-detail-map?vehicleId=${vehicleId}`);
+
+}, 100);
+
+}}
+
+/>
+
+</CnPageFooter>
+
+)}
+
+```
+
+  
+
+> **面试要点**：为什么同一个接口调两次，而不是设计两个接口？
+
+> 答：`firstEnterConfirmPage` 是业务标志位，接口内部根据这个值决定检测策略（第一次可能更严格，第二次是用户主动操作后的再确认）。两次调用复用同一个接口契约，节省接口开发成本，前端只需传一个 boolean 区分场景。
+
+  
+
+---
+
+  
+
+## 四、while + await 串行异步轮询
+
+  
+
+### 4.1 为什么不用 setInterval？
+
+  
+
+| 方式 | 问题 |
+
+|------|------|
+
+| `setInterval` | 不等上一个请求完成就发下一个，网络慢时请求堆积；需要 `useRef` 管理 id，`useEffect` cleanup 清除，容易泄漏 |
+
+| `while + await` | 严格串行，上一个结束才发下一个；timeout 用 `throw` 明确抛出；逻辑集中在一个 async 函数里，清晰易读 |
+
+  
+
+### 4.2 完整轮询实现
+
+  
+
+```typescript
+
+// index.tsx:1052 — pollWifiInfo
+
+const pollWifiInfo = async ({
+
+udid,
+
+businessAreaId,
+
+deliveryAutoPortBuildingType,
+
+requestId,
+
+interval = 300, // 每次间隔（ms）
+
+maxAttempts = 10 // 最大尝试次数
+
+}) => {
+
+let attemptCount = 0;
+
+let result = null;
+
+  
+
+while (attemptCount < maxAttempts && !result) {
+
+try {
+
+const res = await queryDispatchStatus({
+
+udid,
+
+businessAreaId,
+
+deliveryAutoPortBuildingType,
+
+requestId,
+
+});
+
+  
+
+// NASA 调度系统状态码：2 = 调度成功，3 = 调度失败
+
+if ([2, 3].includes(+res?.data?.nasaOpenAutotransDispatchMsg?.status)) {
+
+result = res.data; // 拿到终态，退出循环
+
+}
+
+} catch (error) {
+
+console.error(`第 ${attemptCount + 1} 次请求失败`, error?.errorMsg);
+
+}
+
+  
+
+attemptCount++;
+
+  
+
+// 只有未拿到结果时才等待，拿到结果后直接退出
+
+if (!result) {
+
+await new Promise(resolve => setTimeout(resolve, interval));
+
+}
+
+}
+
+  
+
+// 超时或明确失败：抛出异常，由调用方 catch 处理
+
+if (!result || result?.nasaOpenAutotransDispatchMsg?.status === 3) {
+
+throw new Error('发车失败');
+
+}
+
+  
+
+return result;
+
+};
+
+```
+
+  
+
+### 4.3 发车主流程：校验 → 创建 → 轮询
+
+  
+
+```typescript
+
+// index.tsx:1096 — toCreateRecord
+
+const toCreateRecord = async () => {
+
+// 1. 组装发车参数（targetIntent 区分派送/揽收意图）
+
+const obj = {
+
+transportParam: {
+
+targetAutoports: (isDeliveryFirst
+
+? [...stopoverPointListArray[0], ...stopoverPointListArray[1]]
+
+: [...stopoverPointListArray[1], ...stopoverPointListArray[0]]
+
+).map(item => ({
+
+utpAutoportId: item.staId,
+
+targetIntent: ['POST_POINT', 'STATION', 'THIRDPOST'].includes(item?.type)
+
+? 'WaybillPost' // 派送意图
+
+: 'WaybillPick', // 揽收意图
+
+})),
+
+returnToHubParam: {
+
+parking: stopoverPointListArray[2]?.length ? {
+
+lineType: stopoverPointListArray[2][0]?.lineType,
+
+utpAutoportId: stopoverPointListArray[2][0]?.utpAutoportId,
+
+parkingSpotId: stopoverPointListArray[2][0]?.parkingSpotId,
+
+} : null
+
+},
+
+fileList: fileList?.map(item => item?.ossKey), // OSS 图片 key
+
+parcelNum: ordCnt,
+
+},
+
+udid,
+
+dispatchType: dispatchType === 'loop' ? '' : 'UTP_AUTO_PORT_DISPATCH',
+
+};
+
+  
+
+try {
+
+// 2. 创建发车记录（同步，得到 requestId）
+
+const createRes = await createRecordNew(obj);
+
+  
+
+// 3. 校验：requestId 不存在 或 detectPass/accept 为 false → 直接失败
+
+if (!createRes?.data?.dispatchRequestResult?.requestId ||
+
+String(createRes?.data?.dispatchRequestResult?.detectPass) === 'false' ||
+
+String(createRes?.data?.dispatchRequestResult?.accept) === 'false') {
+
+CnMessage.show({ content: createRes?.data?.dispatchRequestResult?.errorMsg || '发车失败' });
+
+return;
+
+}
+
+  
+
+// 4. 轮询调度结果（最多 15 次 × 500ms = 最长等 7.5s）
+
+const dispatchStatus = await pollWifiInfo({
+
+businessAreaId,
+
+deliveryAutoPortBuildingType: ["STATION", "PICKUPPOINT", "THIRDPOST"],
+
+udid,
+
+requestId: createRes?.data?.dispatchRequestResult?.requestId,
+
+interval: 500,
+
+maxAttempts: 15,
+
+});
+
+  
+
+// 5. 调度成功：跨页通知列表页刷新
+
+if (+dispatchStatus?.nasaOpenAutotransDispatchMsg?.status === 2) {
+
+CnMessage.show({ content: '操作成功，车辆正在启动中...' });
+
+setIsDepartureSuccess(true);
+
+  
+
+// Jotai atom：通知车辆列表页该车辆状态已变化
+
+setVehicleCreateMapRecordSuccessAtoms(map => {
+
+const newMap = new Map(map);
+
+newMap.set(vehicleId, true);
+
+return newMap;
+
+});
+
+}
+
+} catch (err) {
+
+setMapLoading(false);
+
+CnMessage.show({ content: err?.errorMsg || '发车失败' });
+
+}
+
+};
+
+```
+
+  
+
+---
+
+  
+
+## 五、面试高频追问
+
+  
+
+### Q1：三段式数组里 `isDeliveryFirst` 是 true，但 `stopoverPointListArray[0]` 存的是派送还是揽收？
+
+  
+
+> `isDeliveryFirst = true` 代表当前是"先派后揽"模式，所以 `[0]` 存派送点，`[1]` 存揽收点。
+
+> 切换时 `isDeliveryFirst` 在函数执行时还是旧值（setState 异步），所以用旧值判断当前状态来决定新顺序——这是闭包陷阱，面试时值得主动提。
+
+  
+
+### Q2：拖拽时 `startIndex` 为什么不是 0？
+
+  
+
+> 三类站点对应三个 `DraggableStopoverList`，每个列表内 `index` 从 0 开始，但 `react-sortable-hoc` 的 `SortableElement` 需要全局唯一的 `index` prop。派送段 `startIndex=0`，揽收段 `startIndex = 派送段长度`，这样拖拽时能正确定位全局位置。
+
+  
+
+### Q3：轮询拿到 status=3（失败）是怎么处理的？
+
+  
+
+> `pollWifiInfo` 内部把 status=3 也视为"终态"收集进 `result`，退出 while 循环后再判断：如果 `result.status === 3`，抛出 `Error('发车失败')`，由外层 `toCreateRecord` 的 `catch` 块统一展示错误 Toast。这样轮询函数只负责"拿到终态"，业务错误处理集中在调用方。
+
+  
+
+### Q4：为什么删除站点是 `splice(keyIndex - startIndex, 1)` 而不是 `splice(keyIndex, 1)`？
+
+  
+
+> `keyIndex` 是全局下标（比如揽收段第一个是 2），`startIndex` 是这一段开始的全局偏移，`keyIndex - startIndex` 才是这个元素在当前段数组里的相对下标。用全局下标直接 splice 会越界或删错位置。
+
+  
+
+### Q5：发车成功后怎么通知列表页刷新？
+
+  
+
+> 用 Jotai atom `vehicleCreateMapRecordSuccessAtoms`（类型是 `Map<vehicleId, boolean>`），发车成功后 `set(vehicleId, true)`。列表页通过 `useAtomValue` 订阅这个 atom，值变化时自动重新拉取对应车辆数据，实现跨页状态广播，不需要通过路由传参或 sessionStorage 中转。
+
+  
+
+---
+
+  
+
+## 六、知识点索引（快速定位代码）
+
+  
+
+| 知识点 | 文件 | 行号 |
+
+|--------|------|------|
+
+| 三段式数组定义 | `CreateRecordMap/index.tsx` | 152-165 |
+
+| 先派/先揽切换 | `CreateRecordMap/index.tsx` | 236-260 |
+
+| 站点选择写入三段式 | `CreateRecordMap/index.tsx` | 1150-1178 |
+
+| SortableElement 单项 | `draggable-stopover-list.tsx` | 42-192 |
+
+| SortableContainer 列表 | `draggable-stopover-list.tsx` | 194-221 |
+
+| 拖拽结束回调 onSortEnd | `CreateRecordMap/index.tsx` | 625-637 |
+
+| 第一次车门检测 checkDoor | `CreateRecordMap/index.tsx` | 622-648 |
+
+| 第二次车门检测 confirmDoorClosed | `CreateRecordMap/index.tsx` | 651-673 |
+
+| 滑动发车按钮 SliderRightButton | `CreateRecordMap/index.tsx` | 1237-1252 |
+
+| 异步轮询 pollWifiInfo | `CreateRecordMap/index.tsx` | 1052-1093 |
+
+| 发车主流程 toCreateRecord | `CreateRecordMap/index.tsx` | 1096-1191 |
