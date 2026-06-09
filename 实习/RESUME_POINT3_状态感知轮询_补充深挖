@@ -1,0 +1,1295 @@
+# 简历第三点补充深挖：车辆详情页状态感知轮询
+
+> 对应简历描述：
+>
+> 状态感知轮询：针对车辆详情页高频轮询导致的无效请求问题，结合车辆运行状态与页面可见性动态启停请求，使无效请求减少约 30% - 40%，提升页面恢复可见后的车辆状态同步及时性。
+
+这份文档是离职后面试复盘用的。重点不是背“我做了轮询优化”这句话，而是能讲清楚：
+
+- 为什么车辆详情页必须轮询。
+- 为什么固定轮询会浪费请求。
+- 当前代码里到底用哪些状态启动轮询。
+- 页面不可见、App 切后台、iOS BFCache、遥控、横屏这些场景怎么暂停。
+- 30% - 40% 的收益怎么解释。
+- 当前实现还有哪些边界，怎么诚实地讲。
+
+---
+
+## 0. 一句话项目定位
+
+这是无人车 H5 的车辆详情页实时状态优化。
+
+页面需要展示车辆状态、当前位置、地图轨迹、任务节点、异常状态、操作按钮等信息。早期如果进入详情页后无脑 5 秒轮询，就会在页面不可见、车辆处于稳定状态、用户进入遥控或横屏操作时继续请求，产生大量用户看不到的数据刷新。
+
+我做的核心事情是把轮询从“页面打开就定时请求”改成“满足业务状态 + 页面可见性条件才请求”。
+
+---
+
+## 1. 涉及代码位置
+
+| 模块 | 文件 | 作用 |
+| --- | --- | --- |
+| 车辆详情主页面 | `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/index.tsx` | 状态感知轮询主实现，车辆详情、运输详情、地图、任务节点状态编排 |
+| 任务进行中页 | `src/pages/UnmannedVehicleNew/Vehicle/TaskProgress/index.tsx` | 仍保留 5 秒固定轮询，是当前实现边界 |
+| 车辆列表页 | `src/pages/UnmannedVehicleNew/VehicleList/index.tsx` | `useRequest` + `pollingInterval` 列表刷新，缓存写入 |
+| 车辆列表渲染 | `src/pages/UnmannedVehicleNew/VehicleList/vehicle-list.tsx` | 列表骨架屏、下拉刷新 |
+| 车辆状态枚举 | `src/services/unmannedVehicleNew/types.ts` | `VehicleStatus`、`RecordStatus`、`RecordStatusType` |
+| 地图渲染优化 | `src/pages/UnmannedVehicleNew/components/DeliveryMap/index.tsx` | 轮询数据变化后，避免 ETA 文案变化触发地图清图重绘 |
+| 接口封装 | `src/services/unmannedVehicleNew/index.ts` | `/vehicle/query`、`/transport/detail` |
+| 原文档 | `public/3.md` | 原始梳理，偏方案描述 |
+
+---
+
+## 2. 面试 30 秒版本
+
+我负责过无人车 H5 车辆详情页的状态感知轮询优化。这个页面要实时展示车辆状态、当前位置、任务节点和轨迹，原来固定 5 秒轮询会在页面切后台、锁屏、遥控、横屏或者车辆处于非活跃状态时继续请求，很多请求用户根本看不到。
+
+我把轮询启动条件拆成两层：第一层看车辆业务状态，只有 `DELIVERYING / PICKING / LOADING / RETURN / MOVING / CORRECT / VACANT` 这些需要关注状态才启动 5 秒轮询；第二层看页面可见性，通过 `visibilitychange`、`pageshow/pagehide`、横竖屏和遥控自定义事件维护 `isVisible`，不可见或遥控时清掉定时器。这样把页面不可见和非关注状态下的请求停掉，无效请求减少约 30% - 40%，同时恢复可见后重新建立轮询，保证车辆状态能继续同步。
+
+---
+
+## 3. 面试 3 分钟版本
+
+这个优化发生在无人车车辆详情页。详情页不是普通详情页，它是一个实时业务面板：顶部展示车辆状态、电量、异常；中间展示地图位置和轨迹；下面展示当前任务节点、ETA、站点联系方式；底部还有远程操作、修改返程点、移车、开关机等按钮。
+
+原方案最大的问题是固定轮询：只要用户进了详情页，就每 5 秒请求一次车辆详情，部分状态还会继续请求运输详情和轨迹数据。这样有三个明显浪费：
+
+1. 用户把 H5 切后台、锁屏、跳去遥控页面时，页面不可见，继续请求没有体验收益。
+2. 车辆处于关机、充电、不可用等状态时，实时轨迹和任务节点变化很少，继续高频请求价值不高。
+3. 定时器如果不在状态变化和组件卸载时清理，容易出现重复轮询或页面离开后仍然请求。
+
+我的实现思路是把“是否轮询”抽象成两个条件：
+
+```ts
+const shouldPolling = isVisible && activeVehicleStatus.includes(vehicleAppStatus);
+```
+
+在真实代码里，`isVisible` 不是只看 `document.hidden`，还覆盖了 H5 移动端几个高频场景：
+
+- `visibilitychange`：页面切后台 / 回前台。
+- `pageshow/pagehide`：兼容 iOS Safari / WebView 的 BFCache 场景。
+- `orientationchange` 和 `matchMedia('(orientation: landscape)')`：横屏时暂停，因为横屏通常进入遥控或地图查看。
+- `vehicle-control-start` / `vehicle-control-end`：遥控开始时暂停详情页轮询，遥控结束后恢复。
+
+轮询本身用 `useEffect` 管理，依赖 `vehicleAppStatus`、`businessAreaId`、`retrieveRecordDetail` 和 `isVisible`。每次依赖变化都会先 `clearInterval(intervalId)`，再判断是否属于 7 个可轮询状态，满足条件才启动 5 秒定时器，请求 `retrieveRecordDetail()`。
+
+`retrieveRecordDetail` 里先调用 `/vehicle/query` 拿车辆状态、异常、运输摘要。如果车辆处于派送、揽收、返程、纠偏、离线运输等状态，再调用 `/transport/detail` 拿任务站点、ETA、轨迹和当前定位，用来更新地图气泡、任务路线和轨迹线。
+
+这个优化的收益主要来自两块：页面不可见期间直接停掉请求，非活跃状态不启动轮询。按移动端详情页停留行为估算，后台 / 锁屏 / 遥控 / 横屏和非关注状态会覆盖相当一部分停留时长，所以无效请求能减少约 30% - 40%。同时通过 `pageshow/pagehide` 和 `visibilitychange` 恢复轮询，避免用户回到页面后状态长期不更新。
+
+---
+
+## 4. 为什么这个点有价值
+
+前端实习生写“轮询优化”容易写得很薄，因为面试官会继续问：
+
+- 你轮询哪个接口？
+- 多久轮询一次？
+- 什么状态不轮询？
+- 页面切后台怎么处理？
+- 为什么是 30% - 40%？
+- `visibilitychange` 在移动端一定可靠吗？
+- 定时器怎么清理？
+- 弱网下会不会请求堆积？
+- 恢复可见是不是立即刷新？
+
+这份文档就是为了让你能回答这些追问。
+
+---
+
+## 5. 原问题：固定轮询的浪费
+
+车辆详情页天然需要实时性：
+
+- 车辆状态可能从空闲变为装货、派送、揽收、返程、移车、关机。
+- 地图上车辆位置会随 GPS 更新。
+- 运输任务节点会从待执行、行驶中、停靠中、完成持续变化。
+- 操作按钮是否可用依赖车辆状态和站点状态。
+- 异常标签可能出现或消失，例如长时间停留、车辆未锁等。
+
+所以它不能完全静态缓存，只能通过轮询或长连接获取更新。当前项目里使用的是轮询。
+
+但是固定轮询会把“是否需要实时更新”的判断丢掉：
+
+```txt
+进入详情页
+  -> setInterval 5s
+  -> 一直请求 /vehicle/query
+  -> 某些状态继续请求 /transport/detail
+  -> 页面隐藏、横屏、遥控、车辆稳定时仍然请求
+```
+
+这种请求对用户没有即时价值：
+
+| 场景 | 固定轮询问题 |
+| --- | --- |
+| 用户切后台 | 用户看不到更新，请求浪费 |
+| 用户锁屏 | WebView 不可见，继续请求浪费流量和电量 |
+| 用户进入遥控 | 车辆由遥控流程驱动，详情页轮询会干扰并浪费 |
+| 用户横屏 | 多数是遥控 / 地图查看前置状态，详情页卡片刷新价值低 |
+| 车辆关机 / 充电 / 不可用 | 状态变化频率低，不需要详情页高频刷新 |
+| 页面离开 | 如果定时器没清理，会发生内存泄漏和后台请求 |
+
+---
+
+## 6. 状态枚举：12 个车辆运行状态
+
+文件：`src/services/unmannedVehicleNew/types.ts`
+
+```ts
+export enum VehicleStatus {
+  DELIVERYING = 'DELIVERYING', // 派送中
+  PICKING = 'PICKING',         // 揽收中
+  VACANT = 'VACANT',           // 空闲中
+  MOVING = 'MOVING',           // 移车中
+  CHARGING = 'CHARGING',       // 充电中
+  DISABLED = 'DISABLED',       // 不可用
+  LOADING = 'LOADING',         // 装货中
+  RETURN = 'RETURN',           // 返程中
+  SHUTDOWN = 'SHUTDOWN',       // 关机
+  IN_STARTUP = 'IN_STARTUP',   // 开机中
+  IN_SHUTDOWN = 'IN_SHUTDOWN', // 关机中
+  CORRECT = 'CORRECT',         // 串站中 / 纠偏中
+}
+```
+
+简历里如果说“7/12 激活状态触发轮询”，对应当前代码就是：
+
+```ts
+const activePollingStatuses = [
+  VehicleStatus.DELIVERYING,
+  VehicleStatus.PICKING,
+  VehicleStatus.LOADING,
+  VehicleStatus.RETURN,
+  VehicleStatus.MOVING,
+  VehicleStatus.CORRECT,
+  VehicleStatus.VACANT,
+];
+```
+
+不在详情页轮询白名单里的 5 个状态：
+
+```ts
+const inactivePollingStatuses = [
+  VehicleStatus.CHARGING,
+  VehicleStatus.DISABLED,
+  VehicleStatus.SHUTDOWN,
+  VehicleStatus.IN_STARTUP,
+  VehicleStatus.IN_SHUTDOWN,
+];
+```
+
+这就是“状态感知”的核心证据。
+
+---
+
+## 7. 为什么是这 7 个状态轮询
+
+| 状态 | 业务含义 | 为什么要轮询 |
+| --- | --- | --- |
+| `DELIVERYING` | 派送中 | 车辆位置、ETA、任务节点会持续变化 |
+| `PICKING` | 揽收中 | 揽收站点、ETA、到达状态会变化 |
+| `LOADING` | 装货中 | 装货完成后可能进入发车 / 派送，按钮和状态需要更新 |
+| `RETURN` | 返程中 | 返程 ETA、车辆位置、到达状态会变化 |
+| `MOVING` | 移车中 | 移车目标、车辆位置和任务状态需要同步 |
+| `CORRECT` | 串站 / 纠偏中 | 属于异常运输链路，需要持续关注恢复进度 |
+| `VACANT` | 空闲中 | 空闲车可能被操作、发车、开关机，需要保持详情页按钮状态可用 |
+
+为什么不轮询这些：
+
+| 状态 | 业务含义 | 为什么暂停详情页高频轮询 |
+| --- | --- | --- |
+| `CHARGING` | 充电中 | 状态变化低频，详情页持续高频刷新价值不高 |
+| `DISABLED` | 不可用 | 多数为稳定状态，不需要持续刷新轨迹 |
+| `SHUTDOWN` | 已关机 | 位置和任务变化少 |
+| `IN_STARTUP` | 开机中 | 可以由操作回调触发刷新，不必长期轮询 |
+| `IN_SHUTDOWN` | 关机中 | 同上，属于短时过渡状态 |
+
+面试里注意：不要说“所有非活跃态完全不需要更新”。更准确是：
+
+> 详情页不对这些状态做固定高频轮询，但用户触发操作、进入页面首次加载、返回页面等时仍会主动请求，保证功能可用。
+
+---
+
+## 8. 当前主实现：DetailMap 状态感知轮询
+
+文件：`src/pages/UnmannedVehicleNew/Vehicle/DetailMap/index.tsx`
+
+模块级定时器：
+
+```ts
+let intervalId: NodeJS.Timeout;
+```
+
+页面内部状态：
+
+```ts
+const [isVisible, setIsVisible] = useState(true);
+```
+
+主轮询 effect：
+
+```ts
+useEffect(() => {
+  if (!businessAreaId || !isVisible) return;
+
+  if (intervalId) {
+    clearInterval(intervalId);
+  }
+
+  if (
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.DELIVERYING ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.PICKING ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.LOADING ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.RETURN ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.MOVING ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.CORRECT ||
+    vehicleDetailInfo?.vehicleAppStatus === VehicleStatus.VACANT
+  ) {
+    intervalId = setInterval(() => {
+      retrieveRecordDetail();
+    }, 5 * 1000);
+  }
+
+  return () => {
+    if (intervalId) {
+      clearInterval(intervalId);
+    }
+  };
+}, [
+  transportId,
+  vehicleDetailInfo?.vehicleAppStatus,
+  retrieveRecordDetail,
+  businessAreaId,
+  isVisible,
+]);
+```
+
+这段代码做了几件事：
+
+1. `businessAreaId` 不存在，不轮询。
+2. `isVisible=false`，不轮询。
+3. 每次 effect 重新执行时先清理旧定时器，避免重复轮询。
+4. 只有 7 个业务状态启动 5 秒轮询。
+5. 组件卸载或依赖变化时 `clearInterval`。
+
+可以把它抽象成：
+
+```ts
+const canPolling =
+  Boolean(businessAreaId) &&
+  isVisible &&
+  [
+    DELIVERYING,
+    PICKING,
+    LOADING,
+    RETURN,
+    MOVING,
+    CORRECT,
+    VACANT,
+  ].includes(vehicleAppStatus);
+```
+
+---
+
+## 9. 轮询请求链路：不是只刷一个字段
+
+轮询触发的是 `retrieveRecordDetail()`。
+
+文件：`src/pages/UnmannedVehicleNew/Vehicle/DetailMap/index.tsx`
+
+```ts
+const retrieveRecordDetail = useCallback(async () => {
+  if (!businessAreaId) return;
+
+  return queryVehicleList({
+    businessAreaId,
+    udid,
+    needExceptionInfo: true,
+    needTransportInfo: true,
+  }).then((res) => {
+    const vehicleInfo = res.data.vehicleList[0];
+    // ...
+    setVehicleDetailInfo(vehicleInfo);
+    setRecordId(currentRecordId);
+    setcurrentVehicleRecordId(currentVehicleRecordId);
+    // ...
+  });
+}, [moveInfo, businessAreaId, udid]);
+```
+
+接口封装：
+
+```ts
+export const queryVehicleList = (data: {
+  udid?: string;
+  needTransportInfo?: boolean;
+  needExceptionInfo?: boolean;
+  businessAreaId: string | number;
+}) => {
+  return httpRequest<VehicleList>(
+    '/vehicle/query',
+    'POST',
+    data
+  );
+};
+```
+
+`/vehicle/query` 返回后会更新：
+
+- `vehicleDetailInfo`：车辆状态、电量、设备状态、异常标签、车辆信息。
+- `recordId` / `currentVehicleRecordId`：当前任务记录。
+- `stationId`：站点信息。
+- `actionList` 依赖的车辆状态。
+- 如果是运输相关状态，还会继续查运输详情。
+
+---
+
+## 10. 运输详情链路：轮询间接更新地图和任务节点
+
+当车辆处于运输相关状态，并且有 `transportId` 时，会调用 `getTransportDetail(vehicleInfo)`。
+
+当前代码里触发运输详情的状态：
+
+```ts
+if (
+  (
+    vehicleInfo?.vehicleAppStatus === VehicleStatus.DELIVERYING ||
+    vehicleInfo?.vehicleAppStatus === VehicleStatus.CORRECT ||
+    vehicleInfo?.vehicleAppStatus === VehicleStatus.PICKING ||
+    vehicleInfo?.vehicleAppStatus === VehicleStatus.RETURN ||
+    vehicleInfo?.vehicleAppStatus === VehicleStatus.SHUTDOWN
+  ) && transportId
+) {
+  getTransportDetail(vehicleInfo);
+}
+```
+
+注意这里和轮询白名单不是完全一样：
+
+- 轮询白名单有 `LOADING / MOVING / VACANT`。
+- 运输详情查询更关注真实运输链路：派送、揽收、返程、纠偏、离线运输。
+- `SHUTDOWN` 不在轮询白名单里，但如果车辆处于离线运输状态，详情数据中仍可能需要结合运输详情展示“派送中-离线 / 返程中-离线”。
+
+`getTransportDetail` 调用 `/transport/detail`：
+
+```ts
+export const queryTransportDetail = (data: {
+  udid?: string;
+  businessAreaId: string | number;
+  deliveryAutoPortBuildingType: string[];
+  queryEta: boolean;
+  queryTransportDetail: boolean;
+  queryDriveDoneMileage: boolean;
+  transportId?: string | number;
+  queryTransportEvent?: boolean;
+}) => {
+  return httpRequest<TransportDetail>(
+    '/transport/detail',
+    'POST',
+    data
+  );
+};
+```
+
+请求参数：
+
+```ts
+queryTransportDetail({
+  businessAreaId,
+  udid,
+  deliveryAutoPortBuildingType: ['STATION', 'PICKUPPOINT', 'THIRDPOST'],
+  queryEta: true,
+  queryTransportDetail: true,
+  queryDriveDoneMileage: true,
+  queryTransportEvent: true,
+});
+```
+
+它会更新：
+
+- 地图气泡：`setDetailGraphBubbleDTO(vehicleInfo, res?.data)`。
+- 运输详情：`setTransportInfo(res?.data)`。
+- 任务节点：`setFulfillmentTaskNodeDTOS(fulfillmentTaskNodes)`。
+- 地图轨迹：`setTrackInfo(newInfo)`。
+
+所以这个轮询不是单纯“刷新车辆状态文案”，而是驱动整个车辆详情页的实时展示。
+
+---
+
+## 11. 任务节点状态如何随轮询更新
+
+运输详情里 `transportAutoports` 会被转换成 `fulfillmentTaskNodes`：
+
+```ts
+const fulfillmentTaskNodes = [
+  {
+    deliveryImageNumber: 0,
+    stopoverPointDetailInfoDTO: {
+      eta: dispatchTime ? `${dispatchTime} 已出发` : '',
+      staId: businessAreaId,
+      staName: businessAreaTitle || '起点',
+      title: businessAreaTitle,
+      type: 'START_POINT',
+    },
+  },
+  ...(transportAutoports.map((item, index) => {
+    const time = getTimeField(item.status);
+    const etaTime = formatLocalClock(item[time]);
+    const actualArriveTime = formatLocalClock(item?.actualArriveTime);
+
+    return {
+      deliveryImageNumber: 0,
+      stopoverPointDetailInfoDTO: {
+        contractMobile: item.contractMobile,
+        eta: actualArriveTime
+          ? `${actualArriveTime} 已到达`
+          : etaTime ? `${etaTime} ${TransportStatusType[item.status]} ` : '',
+        staId: item?.utpAutoportId,
+        staName: item?.utpAutoportTitle,
+        title: item?.utpAutoportTitle,
+        recordStatus: RecordStatusType[item.status],
+        type: index === res?.data?.transportAutoports?.length - 1
+          ? 'END_POINT'
+          : 'POST_POINT',
+      },
+    };
+  })),
+];
+
+setFulfillmentTaskNodeDTOS(fulfillmentTaskNodes);
+```
+
+状态映射：
+
+```ts
+export enum RecordStatusType {
+  '初始化' = RecordStatus.CREATING,
+  '待执行' = RecordStatus.CREATING,
+  '已规划' = RecordStatus.CREATING,
+  '行驶中' = RecordStatus.InProgress,
+  '停靠中' = RecordStatus.DONE,
+  '完成' = RecordStatus.DONE,
+  '取消' = RecordStatus.CANCEL,
+}
+```
+
+面试可以这样讲：
+
+> 轮询拿到运输详情后，我会把后端的 `transportAutoports` 转成前端任务节点模型，节点里带 ETA、站点名称、联系人、节点状态和起终点类型。这样车辆状态变化会同时反映在地图气泡、路线卡片和任务节点上。
+
+---
+
+## 12. 地图轨迹如何随轮询更新
+
+`getTransportDetail` 里还会把 `planPath` 和 `historyPath` 转成地图组件需要的路线：
+
+```ts
+const routes = [];
+
+transportAutoports.forEach(item => {
+  item?.planPath && routes.push({
+    path: `LINESTRING(${item?.planPath?.map(
+      subItem => `${subItem?.lng} ${subItem?.lat}`
+    ).join(',')})`,
+    status: 0,
+  });
+
+  item?.historyPath && routes.push({
+    path: `LINESTRING(${item?.historyPath?.map(
+      subItem => `${subItem?.lng} ${subItem?.lat}`
+    ).join(',')})`,
+    status: 1,
+  });
+});
+```
+
+然后生成 `trackInfo`：
+
+```ts
+const newInfo = [{
+  staPoints: transportAutoports?.map(item => ({
+    staId: item?.utpAutoportId,
+    eta: estimateArriveTime ? `${estimateArriveTime}预计到达` : '',
+    wkt: `POINT(${item?.utpAutoportLoc?.lng} ${item?.utpAutoportLoc?.lat})`,
+    status: 0,
+    type: 'POST_POINT',
+  })),
+  endPoint: {
+    wkt: `POINT(${transportAutoports[lastIndex]?.utpAutoportLoc?.lng} ${transportAutoports[lastIndex]?.utpAutoportLoc?.lat})`,
+  },
+  routes,
+}];
+
+setTrackInfo(prev => isEqual(prev, newInfo) ? prev : newInfo);
+```
+
+这里也有一个性能细节：
+
+```ts
+setTrackInfo(prev => isEqual(prev, newInfo) ? prev : newInfo);
+```
+
+如果轮询拿到的数据和上一次一样，就复用旧引用，避免不必要的 React 更新和地图重绘。
+
+---
+
+## 13. 页面可见性：不只是 visibilitychange
+
+当前详情页维护 `isVisible` 的事件包括四类。
+
+### 13.1 标准页面可见性
+
+```ts
+const listener = () => {
+  setIsVisible(!document.hidden);
+};
+
+document.addEventListener('visibilitychange', listener);
+```
+
+这个覆盖：
+
+- 浏览器标签页切换。
+- H5 容器切后台。
+- 锁屏导致页面隐藏。
+
+### 13.2 pageshow / pagehide
+
+```ts
+const handlePageShow = () => {
+  setIsVisible(true);
+};
+
+const handlePageHide = () => {
+  setIsVisible(false);
+};
+
+window.addEventListener('pageshow', handlePageShow);
+window.addEventListener('pagehide', handlePageHide);
+```
+
+为什么要加这两个？
+
+移动端尤其 iOS Safari / WebView 场景，页面可能进入 BFCache。用户返回页面时，不一定完整重新挂载组件，`visibilitychange` 的表现也可能和普通浏览器标签不同。`pageshow/pagehide` 能补一层恢复和冻结信号。
+
+面试可以这样说：
+
+> 我没有只依赖 `visibilitychange`，因为移动端 H5 存在 BFCache 和 WebView 生命周期差异，所以又补了 `pageshow/pagehide`，保证用户返回页面后能恢复轮询。
+
+### 13.3 横屏暂停
+
+```ts
+const mediaQuery = window.matchMedia('(orientation: landscape)');
+
+const handleMediaChange = () => {
+  setIsVisible(!mediaQuery.matches);
+};
+
+const handleOrientationChange = () => {
+  setIsVisible(!window.matchMedia('(orientation: landscape)').matches);
+};
+```
+
+横屏时 `isVisible=false`。
+
+为什么横屏要暂停？
+
+这个项目里横屏通常和遥控、地图大屏查看等操作相关。此时详情页卡片不再是用户关注焦点，继续高频请求会浪费，而且遥控链路可能有自己的实时控制和状态同步。
+
+### 13.4 遥控开始 / 结束
+
+```ts
+const handleVehicleControlStart = (e: CustomEvent) => {
+  logCustom({
+    message: '开始遥控',
+    c1: 'm-yiwangtong-custom.detail',
+    c2: 'vehicle-control-start',
+    c3: `${dayjs().format('YYYY-MM-DD HH:mm:ss')}`,
+  });
+  setIsVisible(false);
+};
+
+const handleVehicleControlEnd = (e: CustomEvent) => {
+  logCustom({
+    message: '结束遥控',
+    c1: 'm-yiwangtong-custom.detail',
+    c2: 'vehicle-control-end',
+    c3: `${dayjs().format('YYYY-MM-DD HH:mm:ss')}`,
+  });
+  setIsVisible(true);
+};
+
+document.addEventListener(
+  'vehicle-control-start',
+  handleVehicleControlStart as EventListener
+);
+document.addEventListener(
+  'vehicle-control-end',
+  handleVehicleControlEnd as EventListener
+);
+```
+
+这里的设计点是：`isVisible` 在代码里不只是“页面在不在屏幕上”，而是“详情页是否应该继续消耗轮询资源”的综合开关。
+
+```txt
+真实页面可见 && 不是遥控 && 不是横屏
+  -> isVisible = true
+
+页面隐藏 / pagehide / 横屏 / 遥控开始
+  -> isVisible = false
+```
+
+---
+
+## 14. 副作用清理：为什么能避免重复轮询
+
+事件监听清理：
+
+```ts
+return () => {
+  document.removeEventListener('visibilitychange', listener);
+  window.removeEventListener('pageshow', handlePageShow);
+  window.removeEventListener('pagehide', handlePageHide);
+  document.removeEventListener('vehicle-control-start', handleVehicleControlStart);
+  document.removeEventListener('vehicle-control-end', handleVehicleControlEnd);
+
+  if (mediaQuery.removeListener) {
+    mediaQuery.removeListener(handleMediaChange);
+  } else {
+    mediaQuery.removeEventListener('change', handleMediaChange);
+  }
+  window.removeEventListener('orientationchange', handleOrientationChange);
+};
+```
+
+定时器清理：
+
+```ts
+return () => {
+  if (intervalId) {
+    clearInterval(intervalId);
+  }
+};
+```
+
+这类清理在面试里很重要。你可以说：
+
+> 轮询不是只写一个 `setInterval`，关键是生命周期管理。状态变化、页面隐藏、组件卸载都要清理旧定时器，否则很容易出现重复请求或页面离开后还在请求。
+
+---
+
+## 15. 状态变化时的轮询生命周期
+
+用流程图理解：
+
+```txt
+页面首次进入
+  -> retrieveRecordDetail() 首次请求
+  -> setVehicleDetailInfo(vehicleInfo)
+  -> vehicleAppStatus 更新
+  -> 轮询 effect 执行
+
+如果 businessAreaId 存在 && isVisible=true && 状态在 7 个白名单中
+  -> clearInterval(旧 timer)
+  -> setInterval(retrieveRecordDetail, 5000)
+
+如果状态变成 CHARGING / DISABLED / SHUTDOWN / IN_STARTUP / IN_SHUTDOWN
+  -> effect 重新执行
+  -> cleanup 清理旧 timer
+  -> 不再创建新 timer
+
+如果页面切后台 / 遥控开始 / 横屏
+  -> setIsVisible(false)
+  -> effect cleanup 清理旧 timer
+  -> 不创建新 timer
+
+如果页面回前台 / 遥控结束 / 竖屏
+  -> setIsVisible(true)
+  -> effect 重新判断状态
+  -> 满足状态则恢复 5 秒轮询
+```
+
+---
+
+## 16. 恢复可见后的同步及时性：当前实现和建议讲法
+
+简历里写“提升页面恢复可见后的车辆状态同步及时性”，这个方向是对的，但要注意当前代码细节。
+
+当前实现：
+
+- `visibilitychange/pageshow/vehicle-control-end` 会把 `isVisible` 改为 `true`。
+- `isVisible=true` 会触发轮询 effect 重新执行。
+- effect 会恢复 5 秒定时器。
+- 也就是说，恢复后会重新进入状态同步链路。
+
+当前没有在 `handlePageShow` 或 `listener` 里直接调用：
+
+```ts
+retrieveRecordDetail();
+```
+
+所以严格说不是“恢复可见立即刷新”，而是“恢复可见后重新建立轮询，最多等待一个轮询周期同步”。如果面试官深挖，建议诚实表述：
+
+> 当前版本在页面恢复可见后会恢复轮询，避免后台回来后长期停留在旧状态。进一步优化可以在 `isVisible` 从 false 变 true 时主动 `retrieveRecordDetail()` 一次，把最长 5 秒等待降到立即刷新。
+
+可以补充一个建议优化代码：
+
+```ts
+const prevVisibleRef = useRef(true);
+
+useEffect(() => {
+  const becameVisible = !prevVisibleRef.current && isVisible;
+  prevVisibleRef.current = isVisible;
+
+  if (becameVisible && businessAreaId) {
+    retrieveRecordDetail();
+  }
+}, [isVisible, businessAreaId, retrieveRecordDetail]);
+```
+
+这段是后续优化建议，不是当前代码已经完整实现的事实。
+
+---
+
+## 17. 为什么无效请求能减少 30% - 40%
+
+这个数字不是魔法，可以用“轮询时间窗口减少”解释。
+
+### 17.1 优化前
+
+假设用户在详情页停留 10 分钟，固定 5 秒轮询：
+
+```txt
+10 * 60 / 5 = 120 次 / 接口
+```
+
+如果其中运输状态还会额外查 `/transport/detail`，那么请求更多：
+
+```txt
+/vehicle/query: 120 次
+/transport/detail: 部分状态下额外触发
+```
+
+### 17.2 优化后减少的时间窗口
+
+请求减少来自这些窗口：
+
+| 减少来源 | 举例 |
+| --- | --- |
+| 页面不可见 | 切后台、锁屏、跳转外部页面 |
+| WebView 生命周期 | pagehide、BFCache 冻结 |
+| 遥控场景 | `vehicle-control-start` 后暂停详情页轮询 |
+| 横屏场景 | 横屏时暂停详情页刷新 |
+| 非白名单状态 | 充电、不可用、关机、开机中、关机中不做详情页高频轮询 |
+
+如果用户 10 分钟详情页停留中，有 3 分钟切后台 / 遥控 / 横屏，有 1 - 2 分钟车辆处于非活跃状态，那么原本固定轮询的请求会明显减少。
+
+保守估算：
+
+```txt
+无效轮询窗口 = 3min - 4min
+总停留窗口 = 10min
+减少比例 = 30% - 40%
+```
+
+面试里建议这样讲：
+
+> 这个 30% - 40% 主要是按页面可见时长和车辆活跃状态时长估算出来的。优化前只要进详情页就按 5 秒请求，优化后只有页面可见且车辆处于 7 个关注状态时才轮询。切后台、锁屏、遥控、横屏以及充电 / 关机 / 不可用状态下的请求都被停掉，所以无效请求会下降。
+
+不要说：
+
+> 我把接口 QPS 绝对降低了 40%。
+
+更准确是：
+
+> 在车辆详情页这个场景内，高频轮询产生的无效请求约减少 30% - 40%。
+
+---
+
+## 18. 列表页轮询对比：useRequest pollingInterval
+
+车辆列表页也有轮询，但策略不同。
+
+文件：`src/pages/UnmannedVehicleNew/VehicleList/index.tsx`
+
+```ts
+const { run: queryVehicleListFn } = useRequest(async () => {
+  queryVehicleList({
+    needTransportInfo: true,
+    needExceptionInfo: true,
+    businessAreaId,
+  }).then((res) => {
+    // ...
+  });
+}, {
+  manual: true,
+  pollingInterval: 10 * 1000,
+  refreshDeps: [sortBy, vehicleStatus, businessAreaId],
+});
+```
+
+列表页是 10 秒轮询，因为它是首页总览，状态变化需要持续感知，但不像详情页那样要根据单车状态精细启停。
+
+为什么详情页不用完全同样的 `useRequest pollingInterval`？
+
+可以这样答：
+
+> 列表页是全局总览，适合用 ahooks 的 `pollingInterval` 管理稳定轮询；详情页是单车实时面板，轮询是否开启依赖车辆状态、页面可见性、遥控和横屏，所以手写 `setInterval + useEffect cleanup` 更方便把业务条件放进生命周期。
+
+---
+
+## 19. 缓存和骨架屏：不是这条简历的主角，但可作为上下文
+
+虽然这条简历主要讲状态感知轮询，但代码里还有配套的列表体验优化。
+
+### 19.1 列表接口返回后写 SessionStorage
+
+文件：`VehicleList/index.tsx`
+
+```ts
+const VEHICLE_LIST_CACHE_KEY = 'vehicleListCache';
+
+sessionStorage.setItem(
+  VEHICLE_LIST_CACHE_KEY,
+  JSON.stringify(vehicleList)
+);
+```
+
+### 19.2 读取缓存函数
+
+```ts
+const loadCachedVehicleList = useCallback(() => {
+  const cachedData = sessionStorage.getItem(VEHICLE_LIST_CACHE_KEY);
+  if (cachedData) {
+    const parsedData = JSON.parse(cachedData);
+    setVehicleData(vehicleStatus ? filtered : parsedData);
+    setTotalList(parsedData);
+    setVehicleListLoading(false);
+    document.querySelector('#root-skeleton')?.remove();
+    return true;
+  }
+  return false;
+}, [vehicleStatus]);
+```
+
+当前代码里有缓存读取逻辑，但调用处被注释掉了：
+
+```ts
+// const hasCachedData = loadCachedVehicleList();
+// if (!hasCachedData || sortBy) {
+//   queryVehicleListFn();
+// }
+// 改为选用缓存  然后加载最新数据 如有变化直接覆盖
+queryVehicleListFn();
+```
+
+所以如果面试只讲这条轮询优化，不要过度强调“详情页缓存已经完整落地”。可以说：
+
+> 项目里列表页有 SessionStorage 缓存和骨架屏配套优化，但这条简历重点是详情页轮询策略。缓存部分在当前代码里有实现痕迹，也有部分注释状态，面试时不把它作为这条成果的核心。
+
+---
+
+## 20. 和地图性能优化的联动
+
+轮询优化减少请求量，地图优化减少请求回来后的重绘成本。
+
+文件：`src/pages/UnmannedVehicleNew/components/DeliveryMap/index.tsx`
+
+```ts
+// 只比较影响地图几何渲染的字段，避免 ETA/文案轮询变化触发清图重绘
+const trajectoryRenderKey = getTrajectoryRenderKey(trajectoryInfo);
+const trajectoryChanged =
+  trajectoryRenderKey !== prevTrajectoryRenderKeyRef.current;
+prevTrajectoryRenderKeyRef.current = trajectoryRenderKey;
+
+if (!trajectoryChanged && hasFitViewRef.current) {
+  // 数据没有实质变化，跳过重绘
+  return;
+}
+
+addOverlayConfig();
+$map.clearMap();
+renderOverlays(trajectoryInfo);
+```
+
+这和简历第二点地图轨迹优化是互补的：
+
+- 第三点控制“什么时候请求”。
+- 第二点控制“请求回来后什么时候重绘地图”。
+
+面试里可以把两者串起来讲：
+
+> 详情页实时链路我做了两层优化：上游通过状态感知轮询减少无效请求，下游通过轨迹 renderKey 避免 ETA 等非几何字段变化导致地图重复清图重绘。
+
+---
+
+## 21. 当前实现边界：一定要知道
+
+这部分很重要，面试官喜欢问“有没有什么不足”。
+
+### 21.1 `TaskProgress` 仍是固定轮询
+
+文件：`src/pages/UnmannedVehicleNew/Vehicle/TaskProgress/index.tsx`
+
+```ts
+// 5秒轮询
+useEffect(() => {
+  if (!businessAreaId) return;
+  if (intervalId) {
+    clearInterval(intervalId);
+  }
+  intervalId = setInterval(() => {
+    retrieveVehicleInfo();
+  }, 5 * 1000);
+
+  return () => {
+    if (intervalId) {
+      clearInterval(intervalId);
+    }
+  };
+}, [retrieveVehicleInfo, businessAreaId]);
+```
+
+这里没有接入 `isVisible` 和状态白名单。
+
+面试建议：
+
+> 主车辆详情页已经做了状态感知轮询，任务进行中页当时保留了固定 5 秒轮询，因为它更偏发车后的实时进度确认，实时性优先。后续可以把同一套可见性门控抽成 hook 后复用到 `TaskProgress`。
+
+### 21.2 当前恢复可见不是立即请求
+
+如前面所说，当前是恢复定时器，不是事件回调里立即请求。
+
+后续优化：
+
+```ts
+if (becameVisible) {
+  retrieveRecordDetail();
+}
+```
+
+### 21.3 `setInterval` 可能在弱网下堆叠
+
+当前主详情页用的是：
+
+```ts
+intervalId = setInterval(() => {
+  retrieveRecordDetail();
+}, 5 * 1000);
+```
+
+如果网络很慢，上一次请求还没结束，下一次 interval 可能又触发。当前接口大多数情况下够快，但更稳的写法是递归 `setTimeout` 或请求锁。
+
+后续优化：
+
+```ts
+const pollingRef = useRef(false);
+
+const tick = async () => {
+  if (pollingRef.current) return;
+  pollingRef.current = true;
+  try {
+    await retrieveRecordDetail();
+  } finally {
+    pollingRef.current = false;
+  }
+};
+```
+
+或者：
+
+```ts
+const loop = async () => {
+  await retrieveRecordDetail();
+  timer = setTimeout(loop, 5000);
+};
+```
+
+### 21.4 `intervalId` 是模块级变量
+
+当前代码：
+
+```ts
+let intervalId: NodeJS.Timeout;
+```
+
+在单页面单实例场景下能工作，但更 React 的写法是：
+
+```ts
+const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+```
+
+原因：
+
+- 避免多个页面实例共享同一个模块级定时器。
+- 避免并发渲染或 KeepAlive 场景下状态互相影响。
+- 生命周期更贴近组件实例。
+
+### 21.5 轮询状态白名单建议抽常量
+
+当前状态判断写在 effect 里：
+
+```ts
+vehicleStatus === A || vehicleStatus === B || ...
+```
+
+后续可以抽成：
+
+```ts
+const DETAIL_POLLING_STATUSES = new Set([
+  VehicleStatus.DELIVERYING,
+  VehicleStatus.PICKING,
+  VehicleStatus.LOADING,
+  VehicleStatus.RETURN,
+  VehicleStatus.MOVING,
+  VehicleStatus.CORRECT,
+  VehicleStatus.VACANT,
+]);
+
+const canPolling = DETAIL_POLLING_STATUSES.has(vehicleAppStatus);
+```
+
+这样后端新增状态时更容易维护。
+
+---
+
+## 22. 如果让你现场重构，会怎么抽 hook
+
+可以把状态感知轮询抽成 `useStateAwarePolling`：
+
+```ts
+interface UseStateAwarePollingOptions {
+  enabled: boolean;
+  interval: number;
+  task: () => Promise<void> | void;
+}
+
+function useStateAwarePolling({
+  enabled,
+  interval,
+  task,
+}: UseStateAwarePollingOptions) {
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runningRef = useRef(false);
+
+  const clearTimer = () => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (!enabled) {
+      clearTimer();
+      return;
+    }
+
+    let disposed = false;
+
+    const loop = async () => {
+      if (runningRef.current) return;
+      runningRef.current = true;
+      try {
+        await task();
+      } finally {
+        runningRef.current = false;
+        if (!disposed) {
+          timerRef.current = setTimeout(loop, interval);
+        }
+      }
+    };
+
+    timerRef.current = setTimeout(loop, interval);
+
+    return () => {
+      disposed = true;
+      clearTimer();
+    };
+  }, [enabled, interval, task]);
+}
+```
+
+再抽一个 `usePageActivity`：
+
+```ts
+function usePageActivity() {
+  const [active, setActive] = useState(true);
+
+  useEffect(() => {
+    const onVisibilityChange = () => setActive(!document.hidden);
+    const onPageShow = () => setActive(true);
+    const onPageHide = () => setActive(false);
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('pagehide', onPageHide);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+  }, []);
+
+  return active;
+}
+```
+
+面试里不一定要说你已经抽成 hook。可以说：
+
+> 当前项目里这套逻辑是在详情页内实现的，如果继续重构，我会把页面活跃状态和轮询调度拆成两个 hook，复用到任务进行中页，并把 `setInterval` 换成递归 `setTimeout` 或请求锁。
+
+---
+
+## 23. 你可以怎么回答“为什么不用 WebSocket”
+
+推荐回答：
+
+> WebSocket 或 SSE 更适合强实时场景，但这个 H5 在移动端 WebView 内运行，涉及弱网、后台、锁屏、App 容器生命周期和服务端推送链路建设成本。当前车辆详情页需要的是秒级状态同步，不是毫秒级控制，所以用状态感知轮询更稳，改动范围小，也更容易和现有 HTTP 接口复用。遥控这种更实时的链路会有自己的控制通道，详情页不需要承担所有实时性。
+
+---
+
+## 24. 你可以怎么回答“为什么不用 ahooks useRequest”
+
+推荐回答：
+
+> 列表页用 `useRequest` 的 `pollingInterval` 很合适，因为它是稳定 10 秒刷新。详情页的启动条件更复杂：车辆状态、页面可见性、pagehide/pageshow、遥控、横屏都会影响轮询是否运行，所以我用 `useEffect + setInterval` 直接控制定时器生命周期。后续也可以封装成一个自定义 hook，本质上还是把业务条件作为 `enabled` 传进去。
+
+---
+
+## 25. 你可以怎么回答“怎么保证不会内存泄漏”
+
+推荐回答：
+
+> 两层清理。第一层是轮询 effect 的 cleanup，每次状态、可见性、业务区域变化或组件卸载时都会 `clearInterval`。第二层是页面生命周期监听的 cleanup，会移除 `visibilitychange`、`pageshow/pagehide`、`orientationchange`、`matchMedia` 和遥控自定义事件监听。这样能避免页面离开后继续请求，也避免重复绑定事件。
+
+---
+
+## 26. 你可以怎么回答“30% - 40% 怎么来的”
+
+推荐回答：
+
+> 它不是单接口理论峰值下降，而是车辆详情页轮询链路里的无效请求减少区间。原来详情页停留期间 5 秒一次固定请求；优化后只有页面可见且车辆处于 7 个关注状态时才轮询。移动端用户经常会切后台、锁屏、进入遥控、横屏查看，车辆也可能处于充电、关机、不可用等低变化状态。这些时间窗口原本都会产生请求，现在被暂停，所以按页面停留时长和无效轮询窗口估算，无效请求约下降 30% - 40%。
+
+---
+
+## 27. 你可以怎么回答“恢复可见后到底多快同步”
+
+推荐回答：
+
+> 当前实现是恢复可见后重新建立 5 秒轮询，所以能避免页面回前台后长期停在旧状态。严格来说，它还不是事件触发后的立即请求。这个点我后续会优化为监听 `isVisible` 从 false 变 true 时主动调用一次 `retrieveRecordDetail()`，这样恢复可见后能马上同步，之后再进入正常 5 秒轮询。
+
+这个回答很重要，说明你知道当前代码边界。
+
+---
+
+## 28. 你可以怎么回答“为什么 VACANT 空闲也轮询”
+
+推荐回答：
+
+> 空闲不是完全静态。车辆详情页里空闲车仍然有发车、移车、开关机、充电等操作入口，状态可能被其他端改变，比如调度系统或其他用户操作导致车辆从空闲变装货或派送。为了保证详情页操作按钮和状态不滞后，空闲态保留低成本的 5 秒轮询。但像关机、不可用、充电这些变化频率更低的状态就不放进高频白名单。
+
+---
+
+## 29. 你可以怎么回答“SHUTDOWN 为什么还查运输详情”
+
+推荐回答：
+
+> 车辆状态里的 `SHUTDOWN` 不在轮询白名单里，但如果车辆是在运输过程中离线，详情页仍然要展示“派送中-离线”或“返程中-离线”的路线和任务节点。所以首次详情请求或特定条件下会用 `transportId` 查运输详情，用运输任务上下文补充展示。轮询白名单和运输详情查询条件不是完全同一层逻辑：前者控制是否持续请求，后者控制当前状态下展示是否需要任务上下文。
+
+---
+
+## 30. 你可以怎么回答“为什么横屏要停”
+
+推荐回答：
+
+> 这个项目里横屏通常对应遥控或地图查看这类沉浸场景。此时详情页卡片不再是主要可见内容，继续让详情页高频轮询收益不大，而且遥控链路有自己的状态同步。把横屏也纳入 `isVisible=false`，可以降低后台详情页请求，同时避免详情页刷新干扰遥控体验。
+
+---
+
+## 31. 简历描述可以稍微优化
+
+当前简历：
+
+```md
+状态感知轮询：针对车辆详情页高频轮询导致的无效请求问题，结合车辆运行状态与页面可见性动态启停请求，使无效请求减少约 30% - 40%，提升页面恢复可见后的车辆状态同步及时性。
+```
+
+更贴代码的版本：
+
+```md
+状态感知轮询：针对无人车详情页固定 5s 轮询导致的后台无效请求问题，基于 `vehicleAppStatus` 维护 7/12 状态轮询白名单，并结合 `visibilitychange`、`pageshow/pagehide`、横竖屏及遥控事件统一控制轮询启停；在页面隐藏、遥控、非活跃车辆状态下清理定时器，使无效请求减少约 30% - 40%，提升移动端详情页状态同步稳定性。
+```
+
+如果想保守一点：
+
+```md
+状态感知轮询：优化无人车详情页固定 5s 轮询策略，基于车辆运行状态与页面活跃状态控制请求启停，覆盖切后台、BFCache、横屏和遥控场景，减少页面不可见及非活跃状态下的无效请求约 30% - 40%，提升详情页状态同步稳定性。
+```
+
+---
+
+## 32. 面试可以主动讲的工程取舍
+
+可以这样讲：
+
+> 这个优化不是把轮询间隔粗暴调大，因为调大间隔会伤害运行中车辆的实时性。我做的是把“是否需要轮询”拆成业务条件：运行中、派送中、返程中、移车中这些状态保持 5 秒刷新；页面不可见、遥控、横屏、关机、不可用等场景停掉请求。这样运行中车辆的实时体验不降，但无效窗口的请求能减少。
+
+这个回答能体现你理解性能优化不是“少请求越好”，而是“在体验和资源之间做平衡”。
+
+---
+
+## 33. 当前代码事实清单
+
+这一节用于面试前快速确认，不要讲错。
+
+- `VehicleStatus` 当前有 12 个枚举。
+- 主详情页轮询白名单是 7 个：`DELIVERYING / PICKING / LOADING / RETURN / MOVING / CORRECT / VACANT`。
+- 主详情页轮询间隔是 5 秒。
+- 主详情页用 `isVisible` 控制轮询启停。
+- `isVisible` 来源包括：`visibilitychange`、`pageshow/pagehide`、横屏监听、`vehicle-control-start/end`。
+- 轮询请求入口是 `retrieveRecordDetail()`。
+- `retrieveRecordDetail()` 调 `/vehicle/query`。
+- 运输相关状态下会继续调 `/transport/detail`。
+- `/transport/detail` 会更新地图气泡、任务节点、轨迹线。
+- 轮询 effect 有 `clearInterval` cleanup。
+- 页面生命周期监听也有 cleanup。
+- `TaskProgress` 仍然是固定 5 秒轮询。
+- 当前恢复可见是恢复轮询，不是立即调用接口。
+- 地图组件有 `trajectoryRenderKey`，避免轮询里 ETA / 文案变化导致重复清图重绘。
+
+---
+
+## 34. 复盘关键词
+
+面试前可以背这些关键词：
+
+- 固定 5 秒轮询
+- 状态感知
+- 7/12 状态白名单
+- `vehicleAppStatus`
+- `isVisible`
+- `visibilitychange`
+- `pageshow/pagehide`
+- BFCache
+- 横屏暂停
+- 遥控事件暂停
+- `clearInterval`
+- `/vehicle/query`
+- `/transport/detail`
+- 地图气泡
+- 任务节点
+- ETA
+- 无效请求窗口
+- 30% - 40%
+- 恢复轮询
+- 后续优化：立即刷新、请求锁、递归 `setTimeout`、抽 hook
+
+---
+
+## 35. 最终推荐讲法
+
+> 我做的是无人车详情页的状态感知轮询优化。这个页面需要实时展示车辆状态、地图位置、轨迹、任务节点和操作按钮，原来固定 5 秒轮询会在切后台、锁屏、遥控、横屏或者车辆低变化状态下继续请求。我的思路是把轮询启动条件拆成两个维度：业务上只对 `DELIVERYING / PICKING / LOADING / RETURN / MOVING / CORRECT / VACANT` 这 7 类状态轮询；页面活跃性上通过 `visibilitychange`、`pageshow/pagehide`、横竖屏和遥控自定义事件维护 `isVisible`，不可见就清掉定时器。轮询请求会先查 `/vehicle/query` 更新车辆状态和异常，运输中再查 `/transport/detail` 更新轨迹、ETA 和任务节点。这样运行中车辆仍保持 5 秒同步，但页面不可见和非活跃状态下不再请求，无效请求减少约 30% - 40%。当前版本恢复可见后会恢复轮询，后续还可以补一次立即刷新和请求锁，让弱网场景更稳。
+
