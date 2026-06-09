@@ -1,0 +1,915 @@
+# 面试速记版：取货链路埋点体系与 Taro 小程序
+
+## 使用方式
+
+这份文档不是长文档，而是面试前半小时看的“压缩版”。目标是让你离职后没有源码，也能快速恢复记忆。
+
+复习顺序建议：
+
+1. 先背 `30 秒版`。
+2. 再熟悉 `3 分钟版` 的结构。
+3. 最后看 `追问问答` 和 `伪代码`。
+
+面试时不要把所有内容倒出来。你要根据面试官的问题，从这里抽一段讲。
+
+---
+
+## 0. 简历原句拆解
+
+简历点：
+
+> 业务埋点体系：针对小程序取货链路缺少可观测性、线上问题定位成本高的问题，建设页面访问、关键操作、用户身份和接口异常的埋点体系，串联扫码、开箱、完成取件等核心流程，支持业务转化分析与异常排查。
+
+拆成 6 个关键词：
+
+| 关键词 | 面试解释 |
+| --- | --- |
+| 业务背景 | 取货小程序线上问题难定位，用户说“扫码没反应、开不了门、完成失败”时缺证据 |
+| 覆盖范围 | 页面访问、关键操作、用户身份、接口异常、业务日志 |
+| 核心链路 | 首页扫码/取件码 -> 查单 -> 货单列表 -> 开箱 -> 更新状态 -> 完成取件 -> 订阅提醒 |
+| 技术实现 | Taro + React + ZEM SDK + PageLayout + useTrackClick + 请求拦截器 |
+| 排障价值 | 能按“用户 -> 页面 -> 操作 -> 接口 -> 错误码”回放 |
+| 分析价值 | 能做入口到完成取件的漏斗分析 |
+
+---
+
+## 1. 30 秒版
+
+可以直接背：
+
+> 我在实习里做过一个 Taro + React 取货小程序的链路埋点建设。背景是取货链路以前不可观测，用户反馈“扫码没反应、开不了门、完成取件失败”时，前端和业务很难判断问题发生在哪一步。我做的是把页面访问、关键点击、用户身份和接口异常统一接入到核心链路里，覆盖首页扫码、取件码取货、货单列表、开箱、完成取件和订阅提醒。技术上用了 ZEM 小程序 SDK、公共 `PageLayout` 页面曝光、`useTrackClick` 点击埋点、用户登录/免登录身份绑定，以及请求拦截器里的 HTTP/业务/网络异常上报。最后能按“用户、页面、操作、接口、错误码”回放问题，也能支持扫码入口到完成取件的转化漏斗分析。
+
+---
+
+## 2. 3 分钟版
+
+### 2.1 背景
+
+这个项目是一个 Taro 4 + React 18 的取货小程序，用户主要通过两条链路取货：
+
+1. 扫码取货：用户在首页扫码，解析车辆名，根据手机号查货单。
+2. 取件码取货：用户输入 6 位取件码，免登录查货单。
+
+进入货单列表后，用户可以开门取货、开单个格口、一键全开、进入订单详情、完成取件，并在完成后申请订阅下一次取货提醒。
+
+以前的问题是链路不可观测。用户说“开不了门”时，可能是扫码失败、查单失败、车辆分区路由错误、开箱接口失败、订单状态更新失败，也可能是完成取件按钮倒计时或订阅流程中断。没有埋点时，只能靠用户描述和后端零散日志排查。
+
+### 2.2 方案
+
+我把方案拆成五层：
+
+1. `SDK 初始化层`
+   应用启动时初始化 ZEM 小程序 SDK，区分 dev/uat/prod，记录小程序版本，生产环境才上报。
+
+2. `页面访问层`
+   在公共 `PageLayout` 中使用 `useDidShow` 统一上报页面曝光，并带上路由参数和 `_track_from` 来源页。
+
+3. `关键操作层`
+   在首页、登录页、取件码页、货单列表、订单详情、个人中心等页面，用 `useTrackClick` 记录扫码、取件码入口、开门、开格口、完成取件、订阅提醒等关键动作。
+
+4. `身份关联层`
+   登录用户通过 `getCurrentUser()` 获取 `userId/userName/mobileNumber` 做强身份；取件码免登录用户用货单里的收件人姓名和手机号做弱身份。
+
+5. `异常观测层`
+   在请求底座和响应拦截器里统一处理 HTTP 非 2xx、HTTP 200 但业务失败、网络异常和未知异常，附带 URL、method、请求参数、错误码等上下文。
+
+### 2.3 项目里的特殊点
+
+这个取货业务还有一个关键上下文：车辆分区。
+
+开箱、手机号查单、完成取件等接口需要根据 `vehicleName` 动态路由到车辆所属分区网关。项目通过 `X-Partition-Vehicle` header 做请求拦截，先查询车辆分区，再改写请求 baseURL，并用缓存避免重复查询。
+
+这个细节能说明我不是只会加按钮埋点，而是理解业务上下文，因为车辆分区错了，用户体感就是查不到单或开不了门。
+
+### 2.4 结果
+
+最后，这套体系支持两类能力：
+
+1. `异常排查`
+   可以按用户或手机号回查：用户进了哪个页面、点了哪个按钮、触发了哪个接口、接口是 HTTP 错、业务错还是网络错。
+
+2. `转化分析`
+   可以看首页扫码/取件码入口，到货单列表曝光、开箱、完成取件的漏斗，知道哪一步流失。
+
+### 2.5 反思
+
+当前版本已经覆盖主链路，但我也能看到后续优化点：
+
+1. 事件名可以枚举化，避免中文字符串手误。
+2. 手机号、取件码等敏感字段要做 hash 或脱敏。
+3. 自动开箱、完成取件成功这类结果事件可以显式补齐。
+4. 取件码确认按钮可以补充点击事件，让漏斗更完整。
+
+---
+
+## 3. STAR 版本
+
+### S：Situation
+
+取货小程序缺少统一可观测性，线上问题定位成本高，扫码、开箱、完成取件等关键流程出现问题时，很难判断问题发生在哪一步。
+
+### T：Task
+
+建设覆盖页面访问、关键操作、用户身份和接口异常的埋点体系，把扫码、开箱、完成取件等核心流程串起来，支持业务转化分析和异常排查。
+
+### A：Action
+
+1. 初始化 ZEM SDK，区分环境、版本和生产开关。
+2. 用 `PageLayout + useDidShow` 统一页面曝光。
+3. 用 `useTrackClick` 覆盖首页扫码、取件码、开门、开格口、完成取件等关键动作。
+4. 登录用户做强身份绑定，取件码用户做弱身份绑定。
+5. 在请求底座和响应拦截器里上报 HTTP 异常、业务异常、网络异常。
+6. 结合车辆分区路由、订阅消息、完成取件弹窗等业务上下文补充日志。
+
+### R：Result
+
+链路从黑盒变成可回放：可以按“用户 -> 页面 -> 操作 -> 接口 -> 错误码”排查，也能支持“首页入口 -> 货单列表 -> 开箱 -> 完成取件”的漏斗分析。
+
+---
+
+## 4. 核心代码关键词
+
+面试官问“你具体怎么做的”，先说关键词，再展开。
+
+| 能力 | 3 个代码关键词 |
+| --- | --- |
+| SDK 初始化 | `createZEMClient`、`getAccountInfoSync`、`enable: production` |
+| 全局注入 | `ZEMProvider`、`useLaunch`、`refetchUser` |
+| 页面曝光 | `PageLayout`、`useDidShow`、`trackPageView` |
+| 点击埋点 | `useTrackClick`、事件名、事件参数 |
+| 登录身份 | `getCurrentUser`、`identify`、`mobileNumber logger` |
+| 免登录身份 | `getOrderByCode`、`firstOrder.name`、`firstOrder.contact` |
+| 请求异常 | `Taro.request`、`RequestError`、`ServerException` |
+| 网络异常 | `NetworkException`、`UnknownException`、`responseRejected` |
+| 车辆分区 | `X-Partition-Vehicle`、`partitionCache`、`baseURL rewrite` |
+| 扫码取货 | `Taro.scanCode`、`parse vehicleName`、`getOrderByPhone` |
+| 开箱链路 | `openBox`、`updateStatus`、`startCountdown` |
+| 完成取件 | `batchCompletePick`、`ConfirmModal`、`requestSubscribeMessage` |
+| 小程序配置 | `defineAppConfig`、`definePageConfig`、`navigationStyle: custom` |
+| 跨端适配 | `process.env.TARO_ENV`、`isWeapp`、`isAlipay` |
+
+---
+
+## 5. 必背伪代码
+
+### 5.1 ZEM 初始化
+
+```ts
+function getEnvironment() {
+  if (process.env.NODE_ENV === 'development') return 'dev';
+
+  const { miniProgram } = Taro.getAccountInfoSync();
+
+  if (miniProgram.envVersion === 'develop') return 'dev';
+  if (miniProgram.envVersion === 'trial') return 'uat';
+  return 'prod';
+}
+
+const zemClient = createZEMClient({
+  appKey: 'mini_pick',
+  environment: getEnvironment(),
+  version: getMiniProgramVersion(),
+  enable: process.env.NODE_ENV === 'production',
+  debug: getEnvironment() !== 'prod',
+});
+```
+
+讲法：
+
+> 初始化阶段就做环境隔离、版本标记和生产开关，避免开发数据污染线上报表。
+
+### 5.2 App 全局注入
+
+```tsx
+function App({ children }) {
+  const refetchUser = useUserStore(state => state.refetch);
+
+  useLaunch(() => {
+    refetchUser();
+  });
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ZEMProvider client={zemClient}>
+        {children}
+      </ZEMProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+讲法：
+
+> ZEMProvider 让页面里能使用 `useTrackClick` 和 `useTrackPageView`。`useLaunch` 用来启动时恢复用户状态。
+
+### 5.3 页面曝光
+
+```tsx
+let lastPath: string | undefined;
+
+function PageLayout({ title, children }) {
+  const router = useRouter();
+  const trackPageView = useTrackPageView();
+
+  useDidShow(() => {
+    const { $taroTimestamp, ...params } = router.params;
+
+    trackPageView(router.path, title || router.path, {
+      ...params,
+      _track_from: lastPath,
+    });
+
+    lastPath = router.path;
+  });
+
+  return <Page title={title}>{children}</Page>;
+}
+```
+
+讲法：
+
+> 小程序返回页面时不一定重新 mount，所以曝光用 `useDidShow` 而不是 `useEffect`。
+
+### 5.4 登录用户身份绑定
+
+```ts
+async function handleLoginSuccess() {
+  const user = await getCurrentUser();
+
+  zemClient.identify({
+    userId: user.id,
+    userName: user.username,
+  });
+
+  zemClient.logger.info('mobileNumber', {
+    mobileNumber: user.mobileNumber,
+  });
+
+  setUser(user);
+}
+```
+
+讲法：
+
+> identify 绑定强身份，手机号作为业务日志补充，方便按用户或手机号排查。
+
+### 5.5 取件码免登录身份
+
+```ts
+async function handleCodeConfirm(verifyCode) {
+  clearVehiclePartitionCache();
+
+  const res = await getOrderByCode(verifyCode);
+  const firstOrder = res.dispatch.orderList[0];
+
+  if (!firstOrder) {
+    showToast('暂无货单信息');
+    return;
+  }
+
+  zemClient.identify({
+    userId: '',
+    userName: firstOrder.name,
+  });
+
+  zemClient.logger.info('mobileNumber', {
+    mobileNumber: firstOrder.contact,
+  });
+
+  navigateTo('/pages/orderList/index', {
+    type: 'CODE',
+    vehicleName: res.name,
+    verifyCode,
+  });
+}
+```
+
+讲法：
+
+> 取件码链路不要求登录，所以用收件人信息做弱身份，避免免登录链路变成匿名黑盒。
+
+### 5.6 请求异常
+
+```ts
+async function request(config) {
+  const finalConfig = await runRequestInterceptors(config);
+  const response = await Taro.request(finalConfig);
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    reportException(new RequestError({
+      statusCode: response.statusCode,
+      url: finalConfig.url,
+      method: finalConfig.method,
+      data: finalConfig.data,
+      response: response.data,
+    }));
+
+    throw new RequestError('HTTP 请求失败');
+  }
+
+  response.config = finalConfig;
+  return runResponseInterceptors(response);
+}
+```
+
+讲法：
+
+> HTTP 非 2xx 在请求底座统一处理，页面不用每个接口单独写异常埋点。
+
+### 5.7 业务异常
+
+```ts
+function responseFulfilled(response) {
+  const { success, isSuccess, data, message, errorCode } = response.data;
+
+  if (success || isSuccess) {
+    return data;
+  }
+
+  reportException(new ServerException({
+    message,
+    code: errorCode,
+    url: response.config.url,
+    method: response.config.method,
+    extra: {
+      data: response.config.data,
+    },
+  }));
+
+  showToast(message);
+  throw new ServerError(message, errorCode);
+}
+```
+
+讲法：
+
+> HTTP 200 不代表业务成功，所以还要看 `success/isSuccess`。
+
+### 5.8 网络异常
+
+```ts
+function responseRejected(error, config) {
+  try {
+    reportException(new NetworkException({
+      message: error.message || error.errMsg,
+      code: error.code,
+      url: config.url,
+      method: config.method,
+      extra: {
+        data: config.data,
+        status: error.response?.status,
+      },
+    }));
+  } catch (reportError) {
+    reportException(new UnknownException(reportError));
+  }
+
+  throw normalizeNetworkError(error);
+}
+```
+
+讲法：
+
+> 网络异常和上报过程自己的异常也要兜住，但埋点不能阻断主流程。
+
+### 5.9 车辆分区路由
+
+```ts
+const VEHICLE_HEADER = 'X-Partition-Vehicle';
+const partitionCache = new Map();
+
+request.interceptors.request.use(async config => {
+  const vehicleName = config.headers?.[VEHICLE_HEADER];
+  if (!vehicleName) return config;
+
+  let partitionPromise = partitionCache.get(vehicleName);
+  if (!partitionPromise) {
+    partitionPromise = getPartitionByVehicle(vehicleName);
+    partitionCache.set(vehicleName, partitionPromise);
+  }
+
+  const partition = await partitionPromise;
+
+  if (partition?.gatewayHost) {
+    config.baseURL = `https://${partition.gatewayHost}`;
+  }
+
+  return config;
+});
+
+function clearVehiclePartitionCache() {
+  partitionCache.clear();
+}
+```
+
+讲法：
+
+> 车辆分区是取货业务的关键上下文。请求发错分区，就可能查不到单或开不了箱。
+
+### 5.10 扫码取货
+
+```ts
+function handleScan(mobileNumber) {
+  if (!mobileNumber) {
+    navigateTo('/pages/login/index');
+    return;
+  }
+
+  Taro.scanCode({
+    onlyFromCamera: true,
+    scanType: 'QR_CODE',
+    success: async res => {
+      const vehicleName =
+        parseVehicleName(res.result) ||
+        (await getZelosVehicleName(res.result)).name;
+
+      clearVehiclePartitionCache();
+
+      const orderResult = await getOrderByPhone(vehicleName, mobileNumber);
+      const orderList = orderResult.dispatch.orderList || [];
+
+      if (!orderList.length) {
+        showToast('暂无货单信息');
+        return;
+      }
+
+      navigateTo('/pages/orderList/index', {
+        type: 'PHONE',
+        vehicleName,
+        mobileNumber,
+      });
+    },
+  });
+}
+```
+
+讲法：
+
+> 扫码后不是直接开箱，而是先解析车辆名、查货单、再进入货单列表。
+
+### 5.11 开箱与完成取件
+
+```ts
+async function handleOpenBox(vehicleName, gridNos, orderIds, autoOpen) {
+  try {
+    startCountdown();
+    await openBox(vehicleName, gridNos, autoOpen);
+    await updateStatus(vehicleName, orderIds);
+  } catch (error) {
+    stopCountdown();
+    throw error;
+  }
+}
+
+async function handleConfirmComplete(vehicleName, orderList) {
+  const orderIds = orderList.map(order => order.id);
+
+  await batchCompletePick(vehicleName, orderIds);
+
+  if (shouldSubscribe) {
+    showSubscribeConfirm();
+  } else {
+    reLaunch('/pages/index/index');
+  }
+}
+```
+
+讲法：
+
+> 开门只是动作，开箱接口成功后还要更新订单状态；完成取件要走 `batchCompletePick`。
+
+### 5.12 订阅消息
+
+```ts
+Taro.requestSubscribeMessage({
+  tmplIds: [CODE_TEMP_ID, VEHICLE_TEMP_ID],
+  success(res) {
+    logger.info('requestSubscribeMessageSuccess', res);
+  },
+  fail(res) {
+    logger.info('requestSubscribeMessageFail', res);
+  },
+  complete(res) {
+    logger.info('requestSubscribeMessageComplete', res);
+    reLaunch('/pages/index/index');
+  },
+});
+```
+
+讲法：
+
+> 订阅消息必须由用户动作触发，所以放在完成取件确认后的流程里。
+
+---
+
+## 6. 面试高频问题与标准回答
+
+### Q1：你为什么做这套埋点？
+
+A：
+
+> 因为取货链路线上问题定位成本高。用户反馈“扫码没反应、开不了门、完成取件失败”时，单靠用户描述很难判断问题发生在入口、查单、分区、开箱、状态更新还是完成取件。所以我把问题拆成“看不见页面、看不见操作、看不见人、看不见错”，再分别建设页面曝光、关键点击、身份绑定和接口异常。
+
+补一句：
+
+> 本质上，这是把取货链路从黑盒变成可回放链路。
+
+### Q2：你的埋点体系包括哪些内容？
+
+A：
+
+> 主要四类：第一是页面访问，用公共 `PageLayout` 上报 page view；第二是关键操作，比如扫码、取件码入口、开门、开格口、完成取件；第三是用户身份，登录用户绑定 userId，取件码免登录用户绑定收件人弱身份；第四是接口异常，在请求层统一上报 HTTP 错、业务错、网络错和未知错。
+
+伪代码关键词：
+
+```text
+PageLayout -> trackPageView
+useTrackClick -> key actions
+zemClient.identify -> user identity
+request interceptors -> exception report
+```
+
+### Q3：为什么页面曝光放在 PageLayout？
+
+A：
+
+> 页面曝光是横切能力，不应该每个页面手写。放到公共 `PageLayout` 后，只要页面使用这个容器，就天然有曝光埋点，而且字段一致。后续要加 `_track_from`、过滤路由噪音参数、统一标题，都可以在一个地方处理。
+
+追问：
+
+> 为什么用 `useDidShow`？
+
+回答：
+
+> 因为小程序页面返回时不一定重新 mount，但会触发 show。曝光统计要反映真实显示，所以用 `useDidShow` 比 `useEffect` 更合适。
+
+### Q4：为什么要做用户身份绑定？
+
+A：
+
+> 没有身份时，埋点只能做聚合分析，无法定位某个真实用户的问题。线上排障经常需要按手机号或用户查时间线，所以登录后要 `identify`，取件码免登录也要用收件人信息做弱身份。
+
+边界：
+
+> 继续优化时，手机号、取件码这类敏感字段应该 hash 或脱敏。
+
+### Q5：HTTP 200 为什么也可能算异常？
+
+A：
+
+> 因为 HTTP 200 只说明网络请求成功，不代表业务成功。比如取件码无效、订单状态不允许开箱、车辆分区不对，都可能是 HTTP 200 但业务字段 `success/isSuccess=false`。所以响应拦截器要把业务失败单独上报 `ServerException`。
+
+### Q6：你怎么区分 HTTP 异常、业务异常和网络异常？
+
+A：
+
+> HTTP 非 2xx 在请求底座处理，属于 `RequestError`；HTTP 200 但业务失败，在响应 fulfilled 拦截器里处理，属于 `ServerException`；断网、超时、小程序 request fail，在 rejected 分支里处理，属于 `NetworkException`；如果异常上报过程自己出错，再用 `UnknownException` 兜底。
+
+### Q7：车辆分区和埋点有什么关系？
+
+A：
+
+> 这个业务不是所有请求都打一个网关，而是按车辆分区动态路由。查单、开箱、完成取件都和车辆所在分区有关。如果分区错了，用户看到的可能就是查不到单或开不了门。所以排障时不仅看按钮和接口，还要看 `X-Partition-Vehicle` 对应的分区上下文。
+
+### Q8：如果用户说“扫了码没反应”，你怎么排查？
+
+A：
+
+> 我会按时间线查：第一，看是否有 `首页扫码按钮` 点击；第二，看有没有手机号，没有说明可能跳登录；第三，看扫码后是否解析出车辆名；第四，看 `get_by_phone` 查单接口有没有异常；第五，看是否有货单列表页曝光。如果有点击但没有列表页曝光，问题在扫码解析、查单或跳转阶段；如果列表页曝光了但为空，问题可能是列表页二次查单或订单状态。
+
+### Q9：如果用户说“门没打开”，你怎么排查？
+
+A：
+
+> 我会拆成四步：按钮有没有点，分区路由是否正确，开箱接口 `send_open_box_with_grid` 是否成功，状态更新 `order/status/update` 是否成功。因为用户点击开门不等于业务完成，开箱和订单状态更新是两个步骤。
+
+### Q10：如果用户说“完成取件失败”，你怎么排查？
+
+A：
+
+> 先看是否点击了完成取件按钮，再看是否确认弹窗。如果只点了完成但没确认，说明卡在弹窗；如果确认了，就查 `batch_complete_pick` 是否成功。成功后还要看订阅提醒流程是否正常，比如 `getSetting`、`requestSubscribeMessageSuccess/Fail/Complete`，因为完成取件后还有订阅收尾。
+
+### Q11：你怎么支持转化分析？
+
+A：
+
+> 可以把事件组成漏斗。扫码链路是：首页扫码按钮 -> 货单列表页曝光 type=PHONE -> 开门/开格口/一键全开 -> 确认完成取件 -> `batch_complete_pick` 成功。取件码链路是：首页取件码入口 -> 取件码页曝光 -> 查单成功 -> 货单列表页曝光 type=CODE -> 开箱 -> 完成取件。
+
+### Q12：你怎么验证埋点没漏？
+
+A：
+
+> 我会按核心链路走查：扫码取货、取件码取货、登录、货单列表开门、详情页开格口、完成取件、订阅提醒。每一步检查四类数据：页面曝光、点击事件、用户身份和接口异常。异常验证会构造错误取件码、断网、接口业务失败、错误车辆分区等场景。
+
+### Q13：这套体系有什么不足？
+
+A：
+
+> 第一，事件名现在偏中文字符串，后续最好枚举化，避免手误和重命名影响报表。第二，手机号、取件码等敏感字段需要脱敏。第三，成功事件还可以更标准化，比如 `open_box_success`、`complete_pick_success`，现在有些成功是通过接口结果和后续状态推断。第四，自动开箱最好补充显式埋点。
+
+### Q14：为什么说这是体系，不只是打点？
+
+A：
+
+> 因为它不是只在按钮上加事件，而是分层覆盖了 SDK 初始化、页面曝光、用户身份、关键点击、请求异常、车辆分区和业务日志。最终能把同一个用户在同一时间窗口里的页面、操作、接口和错误串成链路。
+
+### Q15：埋点会不会影响业务流程？
+
+A：
+
+> 原则是埋点不能阻断用户取货。点击埋点和日志记录尽量轻量；异常上报放在已有错误处理流程里；如果上报过程出错，要兜底处理，不让它影响正常业务。
+
+---
+
+## 7. Taro/小程序高频问题与标准回答
+
+### Q1：你为什么说自己熟悉 Taro？
+
+A：
+
+> 这个项目是 Taro 4 + React 18 的真实小程序。我接触过应用配置、页面配置、生命周期、路由、扫码、登录授权、订阅消息、地图定位、请求封装、跨端适配和公共页面容器。不是只会写 `View/Text/Button`，而是理解一个小程序从页面到工程化的完整开发方式。
+
+### Q2：Taro 和原生小程序有什么区别？
+
+A：
+
+> 原生小程序用 WXML/WXSS/JS/JSON，Taro 用 React/TypeScript 写组件，再编译成小程序产物。Taro 提供统一组件和 API，但底层仍然要理解小程序生命周期、页面栈、路由、授权和平台差异。
+
+### Q3：项目里用过哪些小程序配置？
+
+A：
+
+> 全局 `app.config` 配置 pages、subPackages、window、定位权限和隐私接口声明；页面级 `definePageConfig` 配置 `navigationStyle: custom`、`disableScroll`、`transparentTitle` 等。因为项目用了自定义导航栏和公共页面容器，所以很多页面会关掉原生导航和原生滚动。
+
+伪代码：
+
+```ts
+defineAppConfig({
+  pages: ['pages/index/index', 'pages/orderList/index'],
+  subPackages: [{ root: 'subpackages/demo', pages: ['pages/index/index'] }],
+  permission: {
+    'scope.userLocation': { desc: '用于展示取货位置' },
+  },
+  requiredPrivateInfos: ['getLocation'],
+});
+
+definePageConfig({
+  navigationStyle: 'custom',
+  disableScroll: true,
+  transparentTitle: 'always',
+});
+```
+
+### Q4：`useDidShow` 和 `useEffect` 有什么区别？
+
+A：
+
+> `useEffect` 是 React 组件挂载/依赖变化的生命周期；`useDidShow` 对应小程序页面显示。小程序页面栈会缓存页面，返回时不一定重新挂载，所以页面刷新、曝光、订阅状态检查更适合 `useDidShow`。
+
+### Q5：小程序路由怎么做？
+
+A：
+
+> Taro 提供 `navigateTo`、`redirectTo`、`reLaunch`、`switchTab`、`navigateBack`。项目封装了路由管理器，统一参数拼接、登录守卫、权限判断和路由历史。页面参数通过 URL query 传递，页面内用 `useRouter()` 读取。
+
+### Q6：为什么封装公共 Page？
+
+A：
+
+> 因为项目大量页面使用自定义导航栏，需要统一处理顶部安全区、返回按钮、标题、滚动区域、下拉刷新、底部固定按钮、loading、全局弹窗和错误边界。封装公共 Page 后，页面只写业务内容，布局和小程序适配统一处理。
+
+### Q7：微信和支付宝怎么适配？
+
+A：
+
+> 用 `process.env.TARO_ENV` 判断平台。大部分 Taro API 可以复用，但登录授权、跳转其他小程序、部分样式和导航栏行为有差异。比如微信手机号登录用 `openType=getPhoneNumber + Taro.login`，支付宝用 `my.getAuthCode + my.getPhoneNumber`。
+
+### Q8：扫码怎么做？
+
+A：
+
+> 用 `Taro.scanCode`，设置 `onlyFromCamera` 和 `scanType=QR_CODE`。扫码成功后解析二维码内容里的车辆名，查货单，再跳货单列表。还要处理未登录、扫码失败、二维码格式不一致、无货单等情况。
+
+### Q9：订阅消息怎么做？
+
+A：
+
+> 用 `Taro.requestSubscribeMessage`，传模板 ID。订阅消息必须由用户动作触发，所以项目放在完成取件确认后。要处理 success、fail、complete，并在 complete 里做回首页等收尾。
+
+### Q10：定位权限怎么做？
+
+A：
+
+> 配置里声明 `permission` 和 `requiredPrivateInfos`；运行时先 `Taro.getSetting` 检查权限，没有权限用 `Taro.authorize` 申请；拒绝后用 `Taro.showModal` 引导 `Taro.openSetting`；最后用 `Taro.getLocation` 获取位置。
+
+### Q11：地图组件用过吗？
+
+A：
+
+> 用过 Taro 的 `Map` 组件。订单详情里展示停靠点 marker、车辆 marker 和路径 polyline，也封装了 BaseMap 处理默认中心点、拖拽中心点变化和 onRegionChange。
+
+### Q12：请求封装做了什么？
+
+A：
+
+> 基于 `Taro.request` 封装 Request 类，统一 baseURL、headers、timeout、请求/响应拦截器、token 注入、token 刷新队列、HTTP 错误、业务错误和网络错误。
+
+### Q13：token 过期怎么处理？
+
+A：
+
+> 响应拦截器检查 token 是否过期。过期时用 `isRefreshing + refreshPromise + failedQueue` 避免并发重复刷新。第一个请求刷新 token，其他请求进队列，刷新成功后重放队列，失败则跳登录或首页。
+
+伪代码：
+
+```ts
+if (isRefreshing) {
+  return new Promise((resolve, reject) => {
+    failedQueue.push({ resolve, reject, config: originalRequest });
+  });
+}
+
+isRefreshing = true;
+
+try {
+  await renewToken();
+  processQueue(null, newToken);
+  return request(originalRequest);
+} catch (e) {
+  processQueue(e, null);
+  goLogin();
+} finally {
+  isRefreshing = false;
+}
+```
+
+### Q14：小程序开发有哪些坑？
+
+A：
+
+> 页面返回不重新 mount，所以要用 `useDidShow`；自定义导航栏要自己处理安全区；路由参数要编码；订阅消息必须用户动作触发；授权拒绝后要引导 openSetting；微信和支付宝 API 不完全一致；HTTP 200 不代表业务成功；token 刷新要避免并发重复刷新。
+
+---
+
+## 8. 面试场景速查
+
+### 场景 1：面试官只扫简历
+
+你说：
+
+> 这块我做的是 Taro 小程序取货链路的可观测性建设。核心是把扫码、取件码、开箱、完成取件这些流程，用页面曝光、关键点击、身份和接口异常串起来，让线上问题可以按用户时间线回放，也能做转化漏斗。
+
+### 场景 2：面试官问“具体做了哪些埋点”
+
+你说：
+
+> 页面层是 `PageLayout` 自动曝光；行为层覆盖首页扫码、取件码入口、登录、开门、开格口、完成取件、订阅提醒；身份层覆盖登录用户和免登录取件码用户；异常层覆盖 HTTP、业务、网络和未知异常。
+
+### 场景 3：面试官问“你熟悉 Taro 体现在哪”
+
+你说：
+
+> 项目里我接触了 Taro 的配置、生命周期、路由、组件、扫码、登录授权、订阅消息、地图定位、请求封装和跨端适配。比如用 `useLaunch` 初始化用户，用 `useDidShow` 做页面曝光和刷新，用 `definePageConfig` 配自定义导航，用 `Taro.scanCode` 做扫码取货。
+
+### 场景 4：面试官问“你有什么工程化思考”
+
+你说：
+
+> 我会把横切能力沉到公共层。页面曝光放 `PageLayout`，请求异常放请求拦截器，身份绑定放用户状态初始化，路由跳转放 RouterManager。这样覆盖率更高，也避免每个页面重复写。
+
+### 场景 5：面试官问“收益怎么衡量”
+
+你说：
+
+> 如果有报表，可以看问题定位时间、关键接口异常率、入口到完成取件转化率、开箱失败率等。如果没有明确量化数据，我会谨慎说：我的产出是补齐了观测面，让团队具备按用户链路回放和漏斗分析的能力，具体提升比例应以后续线上报表为准。
+
+---
+
+## 9. 不足边界速记
+
+面试主动讲一个不足，会显得真实。
+
+### 边界 1：事件名未枚举化
+
+当前问题：
+
+```ts
+trackClick('货单列表完成取件', '货单列表完成取件');
+```
+
+优化：
+
+```ts
+enum TrackEvent {
+  OrderListCompletePick = 'order_list_complete_pick',
+}
+```
+
+回答：
+
+> 当时为了快速落地和业务可读性，用了中文事件名。后续长期治理会抽事件枚举和事件字典。
+
+### 边界 2：敏感字段要脱敏
+
+涉及：
+
+```text
+mobileNumber
+verifyCode
+contact
+request.data
+```
+
+优化：
+
+```ts
+function maskMobile(mobile) {
+  return mobile.replace(/^(\d{3})\d{4}(\d{4})$/, '$1****$2');
+}
+
+function hashVerifyCode(code) {
+  return sha256(code);
+}
+```
+
+回答：
+
+> 如果往更严格合规走，手机号、取件码、联系人信息应该 hash 或脱敏，并通过字段白名单控制上报。
+
+### 边界 3：成功事件可标准化
+
+当前：
+
+```text
+很多成功通过接口无异常 + 后续状态推断
+```
+
+优化：
+
+```ts
+trackEvent('open_box_success', { vehicleName, gridNos });
+trackEvent('complete_pick_success', { orderIds });
+```
+
+回答：
+
+> 当前能排障，但做精细漏斗时最好补充标准化 success/fail 事件。
+
+### 边界 4：自动开箱可显式埋点
+
+优化：
+
+```ts
+trackEvent('auto_open_box_triggered', { vehicleName, orderId });
+trackEvent('auto_open_box_success', { vehicleName, orderId });
+trackEvent('auto_open_box_failed', { vehicleName, orderId, errorCode });
+```
+
+回答：
+
+> 自动开箱现在可通过 `autoOpen` 参数和接口结果推断，但显式事件会更利于分析自动策略效果。
+
+---
+
+## 10. 最后背诵卡片
+
+### 一句话
+
+> 我做的是 Taro 取货小程序的链路可观测性建设，把页面、操作、身份和接口异常串成用户时间线，支持线上排障和转化分析。
+
+### 三个技术点
+
+```text
+PageLayout + useDidShow
+Request Interceptor + Exception Report
+identify + weak identity for code pickup
+```
+
+### 三个业务点
+
+```text
+扫码取货
+开箱 / 更新状态
+完成取件 / 订阅提醒
+```
+
+### 三个追问答案
+
+```text
+为什么 useDidShow？
+  小程序返回页面不一定 remount。
+
+为什么业务异常也上报？
+  HTTP 200 不代表业务成功。
+
+为什么要车辆分区？
+  请求分区错了会导致查不到单或开不了箱。
+```
+
+### 一个不足
+
+> 当前事件名、敏感字段和成功事件还可以继续治理：事件枚举化、字段脱敏、补充标准化 success/fail event。
+
+### 最稳收尾
+
+> 这段经历不是简单加埋点，而是在真实小程序业务里做了一套前端侧可观测性建设，同时也体现了我对 Taro 小程序生命周期、路由、授权、请求封装和跨端适配的理解。
