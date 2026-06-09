@@ -1,0 +1,2071 @@
+# H5 项目开发学习总结：无人车 H5 实习复盘 / 面试复习版
+
+> 使用场景：
+>
+> 这份文档用于离职后复习 H5 项目开发经验，帮助在简历中写“熟悉 / 了解 H5 项目开发”，并能在面试中讲清楚自己在真实业务项目里学到了什么。
+>
+> 项目背景：`app-sdv-h5` 是一个移动端 H5 项目，主要服务无人车业务，包括车辆列表、车辆详情、地图轨迹、发车任务创建、任务进行中、历史任务、遥控 / WiFi 控制、设置等页面。项目既能运行在普通浏览器，也要适配 App WebView / WindVane / 小程序 WebView / Flutter WebView 等容器。
+
+---
+
+## 0. 一句话总结这个 H5 项目
+
+这是一个面向移动端运营人员的无人车业务 H5 应用。
+
+它不是简单的静态页面，而是一个完整的移动端业务系统：
+
+- 有路由和多页面业务流转。
+- 有登录态、组织 / 业务区、角色菜单等全局状态。
+- 有车辆列表、详情、任务创建、地图轨迹、遥控等复杂交互。
+- 有移动端适配、安全区、触摸事件、骨架屏、WebView 生命周期。
+- 有 WindVane / 小程序 / Flutter Bridge 等容器能力封装。
+- 有 MTOP 和 REST 两套接口请求体系。
+- 有高德地图 SDK、WKT 轨迹渲染、地图性能优化。
+- 有状态感知轮询、缓存、埋点、错误处理、调试工具等工程实践。
+
+如果面试官问“你理解的 H5 开发是什么”，可以回答：
+
+> 我理解的 H5 开发不是只写移动端页面，而是在移动端浏览器或 App WebView 容器里实现完整业务应用。它既要处理 React 页面和状态管理，也要考虑移动端适配、触摸交互、WebView 生命周期、原生 Bridge、登录态、网络请求、首屏性能、调试和兼容性。这个无人车 H5 项目让我第一次完整接触了这些真实工程问题。
+
+---
+
+## 1. 技术栈总览
+
+从 `package.json` 和项目代码可以总结：
+
+| 分类 | 项目使用 | 学到的点 |
+| --- | --- | --- |
+| 构建框架 | Modern.js `@modern-js/app-tools` | H5 项目可以基于工程框架组织构建、路由、输出和开发服务 |
+| 视图框架 | React 17 | 组件化、Hooks、状态驱动 UI |
+| 路由 | `react-router-dom`、`react-router-config`、HashRouter | H5 常用 hash 路由适配静态部署和 WebView |
+| UI 组件 | `@cainiaofe/cn-ui-m`、`antd-mobile` | 移动端组件库、弹窗、页面容器、底部栏、Loading |
+| 状态管理 | Rematch / Redux、Jotai | 全局长期状态和业务局部状态分层 |
+| 请求 | MTOP `request`、REST `httpRequest`、Axios | 容器请求、H5 请求、REST 接口迁移 |
+| 地图 | 高德地图 `@amap/amap-jsapi-loader` | 异步加载 SDK、地图实例管理、WKT 覆盖物渲染 |
+| 样式 | SCSS、`postcss-px-to-viewport`、normalize.css | 移动端适配、vw、基础样式重置、安全区 |
+| 容器桥 | WindVane、Uni API、Flutter Bridge | H5 调原生能力、导航、扫码、定位、存储、电话 |
+| 性能 | 骨架屏、externals、CDN、轮询优化、地图重绘控制 | 首屏体验和运行时性能 |
+| 调试 | vConsole、source map、日志上报 | 移动端远程调试思路 |
+| 测试 | Vitest | 基础单测配置和请求封装测试 |
+
+简历上可以写：
+
+```md
+熟悉移动端 H5 项目开发流程，参与基于 React + Modern.js 的无人车 H5 业务开发，了解 Hash 路由、WebView 容器适配、移动端 vw 布局、安全区处理、原生 Bridge 调用、接口封装、状态管理、首屏骨架屏和性能优化等工程实践。
+```
+
+---
+
+## 2. H5 项目和普通 PC Web 的区别
+
+这个项目让我理解到：H5 开发不是“小屏版 PC 页面”。
+
+### 2.1 运行环境不同
+
+普通 PC Web 主要运行在浏览器标签页里。
+
+H5 项目可能运行在：
+
+- 手机浏览器。
+- App 内 WebView。
+- WindVane 容器。
+- 小程序 WebView。
+- Flutter InAppWebView。
+- 内部工作台容器。
+
+所以代码里经常要判断环境：
+
+```ts
+export function isWindVane() {
+  const ua = window.navigator.userAgent;
+  const wvVersion = ua.match(/WindVane[/\s](\d+[._]\d+[._]\d+)/);
+  return Boolean(wvVersion);
+}
+
+export const isMiniProgram = (window as any).__wxjs_environment === 'miniprogram';
+```
+
+设备判断：
+
+```ts
+const ua = window.navigator.userAgent;
+
+export const isIOS = !!ua.match(/\(i[^;]+;( U;)? CPU.+Mac OS X/);
+export const isAndroid = ua.indexOf('Android') > -1 || ua.indexOf('Adr') > -1;
+export const isWechat = ua.toLowerCase().indexOf('micromessenger') !== -1;
+```
+
+面试回答：
+
+> H5 项目首先要关注运行容器。普通浏览器、App WebView、小程序 WebView 对导航、存储、登录态、页面生命周期和调试能力都有差异，所以项目里会封装 `isWindVane`、`isMiniProgram`、`isIOS`、`isAndroid` 这些环境判断，再根据环境选择不同实现。
+
+### 2.2 交互方式不同
+
+移动端主要是触摸：
+
+- `touchstart`
+- `touchmove`
+- `touchend`
+- 滑动确认
+- 下拉刷新
+- 底部抽屉
+- 固定底部按钮
+- 横竖屏变化
+- 锁屏 / 切后台
+
+项目里发车按钮就用了滑动确认，避免误触：
+
+```ts
+const handleTouchStart = (e) => {
+  if (isDisabled) return;
+  const event = e.targetTouches[0];
+  diff.current =
+    event.clientX - thumbRef.current.getBoundingClientRect().left;
+  sliderRef.current.addEventListener('touchend', handleTouchEnd);
+  sliderRef.current.addEventListener('touchmove', handleTouchMove);
+};
+```
+
+这个让我理解到：
+
+> 移动端 H5 不能只依赖 click。高风险操作，比如发车、取消任务、开关机，通常需要滑动确认、二次弹窗、状态校验等防误触设计。
+
+### 2.3 页面生命周期不同
+
+移动端用户经常：
+
+- 切 App。
+- 锁屏。
+- 返回上一页。
+- 进入原生遥控页。
+- 横屏。
+- WebView 被挂起再恢复。
+
+所以项目里详情页监听：
+
+```ts
+document.addEventListener('visibilitychange', listener);
+window.addEventListener('pageshow', handlePageShow);
+window.addEventListener('pagehide', handlePageHide);
+window.addEventListener('orientationchange', handleOrientationChange);
+document.addEventListener('vehicle-control-start', handleVehicleControlStart);
+document.addEventListener('vehicle-control-end', handleVehicleControlEnd);
+```
+
+面试回答：
+
+> H5 项目要处理页面可见性和 WebView 生命周期。比如车辆详情页轮询不能在页面隐藏、锁屏或遥控时继续跑，所以要结合 `visibilitychange`、`pageshow/pagehide`、横竖屏和业务自定义事件控制轮询启停。
+
+---
+
+## 3. 项目启动和入口流程
+
+### 3.1 构建命令
+
+`package.json`：
+
+```json
+{
+  "scripts": {
+    "start": "modern dev",
+    "build": "modern build",
+    "serve": "modern build && modern serve",
+    "analyze": "cross-env ANALYZER=true modern build --analyze",
+    "test": "vitest",
+    "test:run": "vitest run"
+  }
+}
+```
+
+学到的点：
+
+- `start`：本地开发。
+- `build`：生产构建。
+- `serve`：构建后本地预览。
+- `analyze`：产物分析。
+- `test`：单测。
+
+面试可以说：
+
+> 我了解 H5 项目从本地开发、构建、预览到产物分析的基本流程。这个项目用 Modern.js，开发时跑 `modern dev`，构建时跑 `modern build`，也配置了 bundle analyze 和 Vitest。
+
+### 3.2 HTML 模板
+
+文件：`public/index.html`
+
+核心点：
+
+```html
+<meta name="viewport"
+  content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no" />
+```
+
+含义：
+
+- `width=device-width`：视口宽度等于设备宽度。
+- `initial-scale=1`：默认缩放 1。
+- `maximum-scale=1, minimum-scale=1, user-scalable=no`：禁止用户缩放，避免布局被放大破坏。
+- `viewport-fit=cover`：适配 iPhone 刘海屏 / 安全区。
+- `format-detection`：禁止 iOS 自动识别电话、日期、地址、邮箱等，避免 UI 文案被系统改样式。
+
+面试回答：
+
+> H5 页面入口通常要配置 viewport。这个项目设置了 `viewport-fit=cover` 支持安全区，也禁用了用户缩放和系统自动格式识别，保证移动端页面布局和文案展示稳定。
+
+### 3.3 外部 CDN 资源
+
+HTML 里通过 CDN 引入了：
+
+```html
+<script src="//g.alicdn.com/.../polyfillB.js,...,mtop.js"></script>
+<script src="//g.alicdn.com/mtb/lib-windvane/3.0.7/windvane.js"></script>
+<script src="https://g.alicdn.com/code/lib/react/17.0.2/umd/react.production.min.js"></script>
+<script src="https://g.alicdn.com/code/lib/react-dom/17.0.2/umd/react-dom.production.min.js"></script>
+<script src="https://cn.alicdn.com/lib/cn-ui/cn-ui-m/0.12.54/dist/cn-ui-m.js"></script>
+```
+
+配合构建配置里的 externals：
+
+```ts
+chain.externals({
+  react: 'React',
+  'react-dom': 'ReactDOM',
+  '@cainiaofe/cn-ui-m': 'CNUIM',
+});
+```
+
+理解：
+
+- React / ReactDOM / 组件库不打进业务包。
+- 通过 CDN 加载公共资源。
+- 可以减少业务 JS 包体积。
+- 需要保证 CDN 资源稳定、版本匹配、全局变量名匹配。
+
+面试回答：
+
+> 项目通过 externals 把 React、ReactDOM、移动端组件库拆到 CDN，不打进业务 bundle，降低业务包大小。H5 项目对首屏体积敏感，所以常见做法是公共基础库走 CDN，业务代码单独构建。
+
+---
+
+## 4. Modern.js 配置和 H5 构建
+
+文件：`modern.config.ts`
+
+### 4.1 Hash 路由
+
+```ts
+runtime: {
+  router: {
+    mode: 'hash',
+  },
+  state: false,
+}
+```
+
+为什么 H5 常用 hash 路由？
+
+- 静态资源部署在 CDN 上，不一定能配置服务端 rewrite。
+- WebView 打开的是一个 HTML，hash 后面的路径由前端解析。
+- 分享 / 跳转链接更容易保持在同一个入口 HTML 内。
+
+URL 形态：
+
+```txt
+https://page.cainiao.com/cn-yz/m-unmanned-vehicle#/UnmannedVehicle/vehicle-record-detail-map?vehicleId=xxx
+```
+
+面试回答：
+
+> 这个项目使用 HashRouter。H5 静态部署到 CDN 后，服务端不一定能为每个前端路由做 fallback，所以用 hash 可以保证所有页面都回到同一个 `index.html`，再由前端路由解析。
+
+### 4.2 CDN assetPrefix
+
+```ts
+const cdnHostMap = {
+  pre: 'https://pre-ccdn.zelostech.com.cn/',
+  online: 'https://ccdn.zelostech.com.cn/',
+};
+
+const assetPrefix = cdnHostMap[process.env.build_env || ''] || '/';
+```
+
+产物路径：
+
+```ts
+output: {
+  assetPrefix,
+  distPath: {
+    root: 'dist',
+    js: `${name}/${process.env.prod_version || '0.0.1'}/js`,
+    css: `${name}/${process.env.prod_version || '0.0.1'}/css`,
+    html: `${name}/html`,
+  },
+}
+```
+
+理解：
+
+- 预发和线上使用不同 CDN 域名。
+- JS / CSS 带版本目录，利于缓存和灰度。
+- HTML 单独输出到 html 目录。
+
+面试回答：
+
+> 我了解 H5 发布时静态资源通常走 CDN。项目根据 `build_env` 区分预发和线上 CDN 前缀，并把 JS、CSS 输出到带版本号的目录，便于缓存控制和回滚。
+
+### 4.3 移动端 px 转 vw
+
+```ts
+pxToViewport({
+  viewportWidth: 375,
+  unitPrecision: 5,
+  viewportUnit: 'vw',
+  selectorBlackList: ['.adm-', '.cn-ui-m-'],
+  minPixelValue: 1,
+  mediaQuery: false,
+});
+```
+
+解释：
+
+- 设计稿通常按 375px 宽度。
+- 开发写 `px`，构建时转成 `vw`。
+- 不转换 `.adm-`、`.cn-ui-m-`，避免第三方组件库样式被误改。
+- `minPixelValue: 1` 表示 1px 以下不转，保留细线。
+
+面试回答：
+
+> 移动端 H5 要适配不同屏幕宽度。这个项目使用 `postcss-px-to-viewport`，以 375 设计稿为基准把 px 转 vw，同时把 antd-mobile 和内部组件库选择器放进黑名单，避免第三方组件样式被二次转换。
+
+### 4.4 devServer 代理
+
+```ts
+devServer: {
+  proxy: Object.fromEntries(
+    [
+      '/vehicle',
+      '/business/area',
+      '/transport/dispatch',
+      '/dispatch/preview',
+      '/transport/queryHistory',
+    ].map(path => [
+      path,
+      {
+        target: 'http://nlb-xxx.cn-shanghai.nlb.aliyuncsslb.com',
+        changeOrigin: true,
+      },
+    ])
+  ),
+}
+```
+
+理解：
+
+- 本地开发跨域通过 devServer proxy 解决。
+- 不同业务接口统一代理到后端网关。
+- `changeOrigin` 修改请求 Host，适配后端服务。
+
+面试回答：
+
+> 本地开发时浏览器有跨域限制，项目通过 devServer proxy 把 `/vehicle`、`/transport` 等接口代理到后端网关，调用方仍然写相对路径或统一请求封装。
+
+### 4.5 all-in-one 产物策略
+
+```ts
+chain.optimization.merge({
+  splitChunks: false,
+  runtimeChunk: false,
+});
+
+performance: {
+  chunkSplit: {
+    strategy: 'all-in-one',
+  },
+}
+```
+
+理解：
+
+- 禁用代码分割。
+- 尽量产出一个业务 JS。
+- H5 容器 / CDN 场景下，可以减少多 chunk 加载失败或路径问题。
+- 代价是单包可能更大。
+
+面试回答：
+
+> 这个项目禁用了 splitChunks，采用 all-in-one 策略。对 H5 容器场景来说，多 chunk 加载路径和缓存一致性更容易出问题，单包更稳定；但代价是首包变大，所以又配合 externals 和 CDN 拆出 React 等基础库。
+
+---
+
+## 5. React 入口和应用挂载
+
+文件：`src/index.tsx`
+
+核心结构：
+
+```tsx
+ReactDOM.render(
+  <ThemeProvider>
+    <CssBaseline />
+    <Provider store={store}>
+      <App />
+    </Provider>
+  </ThemeProvider>,
+  document.getElementById('root')
+);
+```
+
+`App` 内部：
+
+```tsx
+<AliveScope>
+  <HashRouter>
+    <Suspense fallback={<CnLoading />}>
+      {renderRoutes(routes)}
+    </Suspense>
+  </HashRouter>
+</AliveScope>
+```
+
+说明：
+
+- `ThemeProvider`：主题。
+- `CssBaseline`：基础样式。
+- `Provider store={store}`：Rematch / Redux 全局状态。
+- `AliveScope`：配合 `react-activation` 做页面缓存。
+- `HashRouter`：前端 hash 路由。
+- `Suspense`：懒加载路由 fallback。
+- `renderRoutes(routes)`：根据路由配置渲染页面。
+
+面试回答：
+
+> 项目入口是 React 标准挂载结构，外层包了主题、Redux store、AliveScope 和 HashRouter。路由组件通过 `React.lazy + Suspense` 懒加载，提升初始加载控制能力。
+
+---
+
+## 6. 路由组织方式
+
+文件：`src/routes/index.ts`
+
+示例：
+
+```ts
+{
+  path: '/UnmannedVehicle/vehicle-list',
+  exact: true,
+  component: lazy(
+    () => import('@/pages/UnmannedVehicleNew/VehicleList')
+  ),
+},
+{
+  path: '/UnmannedVehicle/create-record-new',
+  exact: true,
+  component: lazy(
+    () => import('@/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap')
+  ),
+},
+{
+  path: '/UnmannedVehicle/vehicle-record-detail-map',
+  exact: true,
+  component: lazy(
+    () => import('@/pages/UnmannedVehicleNew/Vehicle/DetailMap')
+  ),
+}
+```
+
+业务页面：
+
+| 路由 | 页面 | 业务 |
+| --- | --- | --- |
+| `/UnmannedVehicle/vehicle-list` | `VehicleList` | 车辆列表 |
+| `/UnmannedVehicle/create-record-new` | `CreateRecordMap` | 创建发车任务 |
+| `/UnmannedVehicle/vehicle-record-detail-map` | `DetailMap` | 车辆详情 |
+| `/UnmannedVehicle/vehicle-map-view` | `MapView` | 地图大图 |
+| `/UnmannedVehicle/history-by-car` | `HistoryByCar` | 单车历史任务 |
+| `/UnmannedVehicle/wifi-control` | `WifiControl` | WiFi / 遥控 |
+| `/UnmannedVehicle/Setting` | `Setting` | 设置 |
+
+项目里还有 Modern.js 文件路由目录：
+
+```txt
+src/routes/UnmannedVehicle/create-record-new/page.tsx
+src/routes/UnmannedVehicle/vehicle-record-detail-map/page.tsx
+src/routes/UnmannedVehicle/vehicle-list/page.tsx
+```
+
+这些页面文件通常只是转发到真实业务页面：
+
+```ts
+import DetailMap from '@/pages/UnmannedVehicleNew/Vehicle/DetailMap';
+
+export default DetailMap;
+```
+
+### 6.1 useRoute 封装
+
+文件：`src/hooks/useRoute.ts`
+
+```ts
+function useRoute() {
+  const history = useHistory();
+  const params = useParams();
+  const location = useLocation();
+  const { query } = UrlParser(location.search, location, true);
+
+  return {
+    history,
+    params,
+    location,
+    query,
+  };
+}
+```
+
+业务代码中：
+
+```ts
+const {
+  query: { vehicleId, udid, modelType, transportId, actionType },
+} = useRoute();
+```
+
+学到的点：
+
+- 页面参数一般从 query 取。
+- H5 链路跳转常通过 URL 携带业务 ID。
+- 封装 `useRoute` 后不用每个页面重复写 `useHistory/useLocation`。
+
+面试回答：
+
+> 项目里封装了 `useRoute`，统一返回 history、params、location 和 query。H5 页面之间经常用 URL query 传业务 ID，比如 `vehicleId`、`udid`、`transportId`，刷新后也能根据 URL 恢复页面状态。
+
+---
+
+## 7. H5 页面跳转和 WebView 导航
+
+普通 Web 可以直接：
+
+```ts
+history.push('/xxx');
+```
+
+但 H5 在 App 容器里可能要打开新 WebView、关闭当前 WebView、替换页面。
+
+项目封装了 `pushWindow`：
+
+```ts
+export const pushWindow = (url, history, killSelf = false, uccore = true) => {
+  const host = `${location.origin}${location.pathname.replace(/^\/+/, '/')}?uccore=${uccore}`;
+
+  if (isWindVane()) {
+    navigateTo({
+      url: `${host}#${url}`,
+      isHash: true,
+      killSelf,
+    });
+  } else if (isMiniProgram) {
+    const formatUrl = `${host}#${url}`;
+    wx?.miniProgram?.navigateTo({
+      url: `/pages/web-view/index?url=${encodeURIComponent(formatUrl)}`,
+    });
+  } else {
+    history.push(url);
+  }
+};
+```
+
+它解决了：
+
+- WindVane 下走 `navigateTo`。
+- 小程序 WebView 下走 `wx.miniProgram.navigateTo`。
+- 普通浏览器下走 React Router `history.push`。
+- hash 路由拼接完整 URL。
+- `killSelf` 支持打开新页面时关闭当前 WebView。
+
+面试回答：
+
+> H5 项目里页面跳转不能只考虑浏览器 history。这个项目把跳转封装成 `pushWindow`，根据 WindVane、小程序和普通浏览器分别走不同导航方式，业务页面只关心跳到哪个前端路由。
+
+### 7.1 打开外部页面
+
+`openNewWebView`：
+
+```ts
+export const openNewWebView = (payload: { url: string }) => {
+  if (!isValidUrl(payload.url)) {
+    logCustom({ message: 'URL异常', data: payload?.url });
+    return Promise.resolve();
+  }
+
+  if (process.env.NODE_ENV === 'development') {
+    // 本地开发特殊处理
+    window.open(...);
+    return Promise.resolve();
+  }
+
+  if (isWindVane()) {
+    return navigateTo({ url: payload.url });
+  } else {
+    return window.open(payload.url);
+  }
+};
+```
+
+学到：
+
+- 外链要做 URL 合法性校验。
+- 本地开发要把线上 H5 URL 转成本地 hash，方便调试。
+- 容器内打开页面要走原生导航能力。
+
+---
+
+## 8. 移动端样式和布局适配
+
+### 8.1 normalize.css
+
+文件：`src/theme/index.scss`
+
+```scss
+@import '~normalize.css';
+```
+
+作用：
+
+- 抹平不同浏览器默认样式差异。
+- 让基础元素展示更可控。
+
+### 8.2 全局字体
+
+```scss
+body {
+  background-color: #f0f0f0;
+  font-size: 16px !important;
+  font-family: 'PingFang SC', 'Chinese Quote', BlinkMacSystemFont, 'Segoe UI',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial,
+    sans-serif;
+}
+```
+
+移动端中文 H5 常用 `PingFang SC`，同时配置系统字体兜底。
+
+### 8.3 安全区适配
+
+HTML：
+
+```html
+viewport-fit=cover
+```
+
+SCSS：
+
+```scss
+@supports (
+  (height: constant(safe-area-inset-top)) or
+    (height: env(safe-area-inset-top))
+) {
+  body {
+    padding-top: constant(safe-area-inset-top);
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: constant(safe-area-inset-bottom);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+```
+
+解释：
+
+- iPhone 刘海屏 / Home Indicator 区域会遮挡内容。
+- `env(safe-area-inset-bottom)` 可以拿到底部安全区高度。
+- 老 iOS 用 `constant()`，新 iOS 用 `env()`。
+
+面试回答：
+
+> 移动端 H5 需要适配 iOS 安全区。项目在 viewport 里设置 `viewport-fit=cover`，再通过 `env(safe-area-inset-bottom)` 和 `constant()` 给 body 补安全区 padding，避免底部按钮被 Home Indicator 遮挡。
+
+### 8.4 禁止 body 滚动，页面内部滚动
+
+```scss
+body {
+  overscroll-behavior: none;
+  overflow: hidden;
+  position: fixed;
+  width: 100%;
+  height: 100%;
+  webkit-overflow-scrolling: touch;
+}
+```
+
+详情页内部：
+
+```scss
+.cn-ui-m-page-content {
+  height: 100%;
+  width: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-flow: column;
+}
+```
+
+为什么这样做：
+
+- 避免 body 滚动导致 iOS 橡皮筋效果。
+- 避免底部 fixed 按钮跟随页面抖动。
+- 让每个页面容器自己控制滚动。
+- `-webkit-overflow-scrolling: touch` 提升 iOS 滚动流畅度。
+
+面试回答：
+
+> 移动端 H5 常见问题是 body 滚动、橡皮筋和 fixed 底部栏抖动。项目里固定 body，把滚动交给页面内容容器，并使用 `-webkit-overflow-scrolling: touch` 优化 iOS 滚动体验。
+
+### 8.5 vw 适配和第三方组件黑名单
+
+开发写：
+
+```scss
+padding: 12px;
+height: 52px;
+```
+
+构建后转成 vw。
+
+但 `.adm-`、`.cn-ui-m-` 不转：
+
+```ts
+selectorBlackList: ['.adm-', '.cn-ui-m-']
+```
+
+原因：
+
+- 第三方组件库已经有自己的适配体系。
+- 强行转可能破坏组件内部样式。
+
+---
+
+## 9. 移动端触摸交互：滑动确认
+
+发车是高风险操作，项目没有用普通按钮，而是滑动确认。
+
+组件：`src/pages/UnmannedVehicleNew/components/sliderRightButton/index.tsx`
+
+关键逻辑：
+
+```ts
+const handleTouchMove = (e) => {
+  e.preventDefault();
+  thumbRef.current.style.transition = 'none';
+
+  const event = e.targetTouches[0];
+  let newX =
+    event.clientX -
+    diff.current -
+    sliderRef.current.getBoundingClientRect().left;
+
+  thumbRef.current.style.left = `${newX}px`;
+  thumbWrapperRef.current.style.width = `${thumbWrapperWidth}px`;
+
+  if (Math.trunc(thumbWrapperWidth) === Math.trunc(sliderWidth)) {
+    handleTouchEnd();
+  }
+};
+```
+
+滑到底后执行：
+
+```ts
+if (action) {
+  action()
+    .then((res) => {
+      if (res) {
+        successAction?.(res);
+        sliderInit();
+      } else {
+        failedAction?.();
+        sliderInit();
+      }
+    })
+    .catch((error) => {
+      failedAction?.();
+      setErrorMsg(error?.errorMsg || error || errorText);
+      sliderInit();
+    });
+}
+```
+
+学到：
+
+- 移动端触摸事件需要计算手指位置。
+- `preventDefault()` 防止页面跟着滚。
+- 高风险操作要有防误触设计。
+- 异步执行后要恢复组件状态。
+- 失败时要展示错误并回弹。
+- 事件监听要移除。
+
+面试回答：
+
+> 我做过移动端触摸交互。项目里的发车按钮是滑动确认，通过 `touchstart/touchmove/touchend` 计算滑块位置，到达阈值后触发异步发车，成功或失败后都重置滑块，避免误触和重复提交。
+
+---
+
+## 10. 状态管理：Rematch 和 Jotai 的分层
+
+### 10.1 Rematch / Redux 管全局长期状态
+
+入口：
+
+```tsx
+<Provider store={store}>
+  <App />
+</Provider>
+```
+
+store：
+
+```ts
+const store = init({
+  models: {
+    org,
+    app,
+    certification,
+    coopStation,
+    greyConfig,
+    contract,
+  },
+});
+```
+
+`org` model 管：
+
+- 组织列表。
+- 当前组织。
+- 当前用户信息。
+- 业务区 ID。
+- 业务区名称。
+- 组织选择弹窗。
+
+示例：
+
+```ts
+setBusinessAreaId(state, payload) {
+  return {
+    ...state,
+    businessAreaId: payload,
+  };
+}
+```
+
+适合放 Rematch 的状态：
+
+- 用户信息。
+- 组织 / 租户。
+- 业务区。
+- 菜单权限。
+- 全局配置。
+- 多页面长期共享的状态。
+
+### 10.2 Jotai 管轻量业务状态
+
+文件：`src/pages/UnmannedVehicleNew/atoms.ts`
+
+```ts
+export const selectedStationAtoms = atom<StopOverPointInfo[]>([]);
+
+export const vehicleCreateMapRecordSuccessAtoms = atom<Map<string, boolean>>(
+  new Map()
+);
+
+export const vehicleHomeTabAtoms = atom<{
+  tabkey: VehicleTabKey;
+}>({
+  tabkey: VehicleTabKey.vehicleList,
+});
+```
+
+Jotai 用于：
+
+- 选中的站点。
+- 发车成功状态。
+- 车辆列表 tab 记忆。
+- 批量选中的车辆。
+- 引导页数据。
+
+为什么不用全放 Redux？
+
+- 一些状态只在无人车业务内部共享。
+- 生命周期更短。
+- 用 atom 更轻量。
+- 页面之间传递比 props 层层传递更方便。
+
+面试回答：
+
+> 我理解状态管理要分层。项目里用户、组织、业务区这类全局长期状态放 Rematch / Redux；无人车业务内部的轻量跨页面状态，比如选中站点、发车成功标记、tab 记忆，放 Jotai atom。这样既避免 Redux 过重，也避免 props drilling。
+
+---
+
+## 11. 接口请求体系：MTOP 和 REST
+
+项目里有两套请求：
+
+- `request`：MTOP 接口。
+- `httpRequest`：REST 接口。
+
+### 11.1 request：MTOP 请求
+
+```ts
+const request = <R = unknown, T = {}>(
+  api: string,
+  data?: T,
+  options: RequestOptions = {}
+): Promise<Response<R>> => {
+  // ...
+  if (ENABLE_MOCK || options.useMock) {
+    return mockRequest(api, data);
+  } else if (isWindVane()) {
+    return nativeRequest(api, data, options);
+  } else if (window.location.href.includes('useH5=true') || !isWindVane()) {
+    return h5Request(api, data, options);
+  }
+};
+```
+
+它会根据环境选择：
+
+| 环境 | 请求方式 |
+| --- | --- |
+| mock | 本地 mock |
+| WindVane | `sendMtop` / 原生能力 |
+| 普通 H5 | `window.lib.mtop.request` |
+
+统一返回：
+
+```ts
+{
+  data,
+  raw,
+}
+```
+
+### 11.2 h5Request
+
+```ts
+window.lib.mtop.request({
+  api,
+  data,
+  v: options.v,
+  dataType: 'json',
+  valueType: 'original',
+  headers,
+  ext_headers: headers,
+})
+```
+
+它会处理：
+
+- accessToken。
+- 小程序 loginSource。
+- session 过期。
+- MTOP 错误格式抹平。
+
+### 11.3 nativeRequest
+
+```ts
+sendMtop(cfg).then((res) => {
+  const response = {
+    data: res?.data?.data,
+    raw: res,
+  };
+});
+```
+
+它适合 App 容器内请求，因为可以走端能力。
+
+### 11.4 httpRequest：REST 请求
+
+```ts
+export const httpRequest = async <R = unknown>(
+  url: string,
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' = 'GET',
+  data?: Record<string, any>,
+  headers?: Record<string, string>
+): Promise<Response<R>> => {
+  const accessToken = await getLocalData('accessToken');
+
+  const config = {
+    method,
+    withCredentials: true,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: accessToken,
+      ...headers,
+    },
+  };
+
+  url = `https://zopen.zelostech.com.cn:8000/cnrobo${url}`;
+  // ...
+};
+```
+
+它处理：
+
+- REST URL。
+- GET 参数拼接。
+- POST body。
+- Authorization。
+- 成功字段判断。
+- 错误格式统一。
+- 请求耗时日志。
+
+### 11.5 request vs httpRequest
+
+项目文档里总结：
+
+| 方式 | 第一个参数 | HTTP 方法 | 参数位置 |
+| --- | --- | --- | --- |
+| `request` | MTOP API 名 | 自动 | 第二个参数 |
+| `httpRequest` | REST 路径 | 需指定 | 第三个参数 |
+
+示例：
+
+```ts
+request<Token>('mtop.xxx.api', { key: 'value' });
+
+httpRequest<Token>('/xxx/api', 'POST', { key: 'value' });
+```
+
+面试回答：
+
+> 项目里同时存在 MTOP 和 REST 两种接口。老接口走 `request`，内部根据 WindVane / H5 / mock 环境选择请求方式；新无人车接口走 `httpRequest`，基于 Axios 调 REST 服务，自动带 Authorization，并统一返回 `{ data, raw }`。调用方拿到的响应结构保持一致，迁移成本比较低。
+
+---
+
+## 12. 登录态和本地存储
+
+H5 登录态经常要同时支持：
+
+- 浏览器 localStorage。
+- WindVane / Uni API storage。
+- 小程序 WebView。
+- Flutter 容器。
+
+项目封装：
+
+```ts
+export const getLocalData = async (key) => {
+  if (isWindVane()) {
+    const r = await getStorage(key);
+    return r?.data?.value;
+  }
+  return localStorage.getItem(key);
+};
+
+export const saveLocalData = async (key, value) => {
+  if (isWindVane()) {
+    const r = await setStorage(key, value);
+    return r;
+  }
+  localStorage.setItem(key, value);
+  return true;
+};
+```
+
+为什么要封装？
+
+- WebView 的 storage 能力可能不是浏览器原生 localStorage。
+- 端上存储可以和 App 共享登录态。
+- H5 代码不应该到处写环境判断。
+
+面试回答：
+
+> H5 登录态和缓存不能只写 localStorage，因为在 App WebView 里可能需要走端提供的 storage。项目封装了 `getLocalData/saveLocalData/removeLocalData`，根据 WindVane 环境选择 Uni API storage 或浏览器 localStorage。
+
+---
+
+## 13. 原生 Bridge 能力
+
+### 13.1 WindVane 通用调用
+
+```ts
+export const callWindvane = <T = unknown, R = unknown>(
+  moduleName: string,
+  methodName: string,
+  payload?: T
+): Promise<R> => {
+  return new Promise((resolve, reject) => {
+    WindVane.call(moduleName, methodName, payload, resolve, reject);
+  });
+};
+```
+
+所有端能力都可以基于它封装：
+
+```ts
+export const makePhoneCall = (payload: string) => {
+  return callWindvane('PhoneCallModule', 'makeCall', {
+    phone: payload,
+  });
+};
+```
+
+```ts
+export const wifiConnectStart = (payload) => {
+  return callWindvane('WiFiConnectModule', 'wifiConnectStart', payload);
+};
+```
+
+```ts
+export const notifyNativeConnect = (payload) => {
+  return callWindvane('VehicleControlModule', 'notifyChannelConnect', payload);
+};
+```
+
+学到的点：
+
+- Bridge 调用要 Promise 化。
+- 业务页面不要直接写 `window.WindVane.call`。
+- 要做开发环境 fallback。
+- 要处理失败。
+- 要隔离端能力差异。
+
+面试回答：
+
+> 我接触过 H5 调原生能力。项目把 WindVane 调用封装成 `callWindvane`，再基于它封装电话、导航、WiFi、扫码、遥控等能力。这样业务层只调用语义化方法，不直接依赖 `window.WindVane.call`。
+
+### 13.2 Flutter Bridge
+
+项目还封装了 Flutter WebView Bridge：
+
+```ts
+export const isFlutterWebView = (): boolean => {
+  return !!(window as any).flutter_inappwebview?.callHandler;
+};
+
+async function callHandler<T = unknown>(
+  handlerName: string,
+  ...args: unknown[]
+): Promise<BridgeResult<T>> {
+  if (!isFlutterWebView()) {
+    return { code: -1, message: `非 Flutter 容器环境` };
+  }
+  try {
+    const result = await window.flutter_inappwebview.callHandler(
+      handlerName,
+      ...args,
+    );
+    return result;
+  } catch (e) {
+    return { code: -1, message: `调用异常: ${e}` };
+  }
+}
+```
+
+能力：
+
+```ts
+export const scanQRCode = () => callHandler<string>('scanQRCode');
+export const getLocation = () => callHandler<LocationData>('getLocation');
+export const getDeviceInfo = () => callHandler<DeviceInfoData>('getDeviceInfo');
+export const closePage = () => callHandler('closePage');
+export const setTitle = (title: string) => callHandler('setTitle', title);
+```
+
+学到：
+
+- Bridge 调用前必须判断环境。
+- 返回值要统一格式。
+- 容器不存在时不能直接报 JS Error。
+- H5 和原生约定 handlerName 和参数。
+
+面试回答：
+
+> Bridge 封装的关键是环境判断、Promise 化、统一返回结构和降级处理。比如 Flutter WebView 不存在时返回 `{ code: -1 }`，而不是直接调用 undefined 导致页面崩溃。
+
+---
+
+## 14. H5 调试：vConsole、日志和埋点
+
+HTML 里按环境加载 vConsole：
+
+```js
+if (
+  window.siteEnv === 'pre' ||
+  window.siteEnv === 'daily' ||
+  window.location.host === 'localhost:8080' ||
+  window.location.host === 'pre-ccdn.zelostech.com.cn'
+) {
+  loadScript(
+    'https://g.alicdn.com/code/lib/vConsole/3.3.4/vconsole.min.js',
+    {
+      uid: 'cdn-vconsole',
+      onload: function () {
+        if (window.VConsole) {
+          var vConsole = new VConsole();
+        }
+      },
+    }
+  );
+}
+```
+
+为什么 H5 需要 vConsole？
+
+- 手机 WebView 没有浏览器 DevTools。
+- 预发 / 日常环境可以直接在手机上看 console、network、storage。
+- 线上一般不打开，避免性能和安全问题。
+
+项目请求也会打日志：
+
+```ts
+console.info(
+  `[${api}] 请求完成`,
+  '耗时:',
+  `${costTime}ms`,
+  '请求参数:',
+  data,
+  '响应数据:',
+  res
+);
+```
+
+并上报：
+
+```ts
+getLogger()?.logApi({
+  api,
+  success: true,
+  requestType: 'mtop',
+  params: JSON.stringify(data),
+  response: JSON.stringify(res?.raw),
+  time: costTime,
+});
+```
+
+业务埋点：
+
+```ts
+logExpose(GOLDLOG_MAPPER.unmannedVehicle.vehicleList, {
+  employeeId,
+  outerId,
+  duty,
+});
+```
+
+面试回答：
+
+> 移动端 H5 调试比 PC 麻烦，所以项目在本地、日常、预发环境按条件加载 vConsole，并在请求封装里统一记录请求耗时、参数、响应和错误，同时接入埋点日志，方便排查 WebView 上的问题。
+
+---
+
+## 15. 首屏体验：HTML 骨架屏 + React 骨架屏
+
+### 15.1 HTML 骨架屏
+
+`public/index.html`：
+
+```html
+<script src="/skeleton-loader.js"></script>
+<div id="root-skeleton"></div>
+<div id="root"></div>
+```
+
+`public/skeleton-loader.js`：
+
+```js
+const SKELETON_ROUTES = {
+  '/UnmannedVehicle/vehicle-list':
+    `${getBasePath()}/et-asp/app-sdv-h5/skeletons/vehicle-list-skeleton.html`,
+};
+
+function loadSkeletonHTML() {
+  const currentPath = window.location.hash.slice(1).split('?')[0];
+  const skeletonPath = SKELETON_ROUTES[currentPath];
+
+  if (skeletonPath) {
+    fetch(skeletonPath)
+      .then((response) => response.text())
+      .then((html) => {
+        const container = document.querySelector('#root-skeleton');
+        if (container) {
+          container.innerHTML = html;
+          setTimeout(() => {
+            document.querySelector('#root-skeleton')?.remove();
+          }, 1000);
+        }
+      });
+  }
+}
+```
+
+作用：
+
+- React JS 还没加载时，HTML 就能展示占位。
+- 减少白屏。
+- 按路由加载对应骨架屏。
+
+### 15.2 React 骨架屏
+
+车辆列表：
+
+```tsx
+if (loading) {
+  return (
+    <div style={{ paddingTop: '12px' }}>
+      <SkeletonVehicleList />
+    </div>
+  );
+}
+```
+
+详情页：
+
+```tsx
+if (loading) {
+  return <Skeleton />;
+}
+```
+
+区别：
+
+| 类型 | 出现时机 | 优点 |
+| --- | --- | --- |
+| HTML 骨架屏 | JS 加载前 | 减少首屏白屏 |
+| React 骨架屏 | React 已运行，接口未返回 | 与真实页面结构更接近 |
+
+面试回答：
+
+> 项目里有两层骨架屏。HTML 模板里先通过 `skeleton-loader.js` 在 React 启动前插入静态骨架屏，减少首屏白屏；React 运行后再根据页面 loading 展示组件级骨架屏。这样覆盖了 JS 加载前和接口加载中两个阶段。
+
+---
+
+## 16. H5 性能优化经验
+
+这个项目里的性能优化不是一个点，而是一组实践。
+
+### 16.1 首屏包体优化
+
+做法：
+
+- React / ReactDOM / UI 库 externals。
+- CDN 加载公共资源。
+- 业务产物 all-in-one。
+- 字体 preload。
+- 骨架屏提前展示。
+
+### 16.2 请求优化
+
+做法：
+
+- 详情页状态感知轮询。
+- 页面不可见暂停请求。
+- 根据车辆状态决定是否轮询。
+- 发车调度用串行轮询避免请求堆积。
+
+### 16.3 渲染优化
+
+做法：
+
+- 地图轨迹用 `trajectoryRenderKey` 判断几何数据是否变化。
+- ETA 文案变化不触发地图清图重绘。
+- `React.memo` 包装地图组件。
+- `isEqual(prev, newInfo) ? prev : newInfo` 复用引用。
+
+### 16.4 体验优化
+
+做法：
+
+- 骨架屏。
+- 滑动确认。
+- Loading / Toast。
+- 下拉刷新。
+- 底部固定操作栏。
+- iOS 安全区处理。
+
+面试回答：
+
+> 我理解 H5 性能要分层看：首屏阶段关注包体、CDN、骨架屏；运行时关注请求频率、轮询生命周期和渲染次数；复杂组件比如地图还要避免不必要的 clearMap 和 setFitView。这个项目里我实际参与了轮询和地图重绘优化，也理解了骨架屏和 externals 的工程配置。
+
+---
+
+## 17. 地图 SDK 和复杂组件管理
+
+无人车 H5 里地图是核心。
+
+### 17.1 异步加载高德地图
+
+```ts
+AMapLoader.load({
+  key: AMapConfig.key,
+  version: AMapConfig.version,
+}).then(async (AMap) => {
+  (window as any).AMap = AMap;
+  await initializeMap(id, {
+    zoom: 12,
+    zooms: [4, 20],
+    mapStyle: 'amap://styles/whitesmoke',
+  });
+  setMapReady(true);
+});
+```
+
+学到：
+
+- 第三方 SDK 通常异步加载。
+- 加载完成前不能渲染覆盖物。
+- 需要 `mapReady` 状态。
+- 部分工具函数依赖全局 `window.AMap`。
+
+### 17.2 地图实例管理
+
+```ts
+let mapInstance: any = null;
+let AMapInstance: any = null;
+
+export async function initializeMap(container, options) {
+  AMapInstance = await AMapLoader.load(...);
+  mapInstance = new AMapInstance.Map(container, options);
+  window._amap_instance = mapInstance;
+  window.AMap = AMapInstance;
+}
+```
+
+卸载时：
+
+```ts
+return () => {
+  Map.destroy();
+};
+```
+
+为什么要 destroy？
+
+- 避免地图实例残留。
+- 避免事件监听和 DOM 覆盖物泄漏。
+- 避免返回页面后出现多个地图实例。
+
+### 17.3 WKT 转地图覆盖物
+
+项目用 WKT 表示点线：
+
+```txt
+POINT(120.123 30.123)
+LINESTRING(120.1 30.1,120.2 30.2)
+```
+
+转换：
+
+```ts
+const pointMatch = wkt.match(/POINT\s*\(\s*([\d.]+)\s+([\d.]+)\s*\)/i);
+const lineMatch = wkt.match(/LINESTRING\s*\(([^)]+)\)/i);
+```
+
+生成：
+
+- `AMap.Marker`
+- `AMap.Polyline`
+
+面试回答：
+
+> 我接触了 H5 里第三方地图 SDK 的生命周期管理。项目通过 `AMapLoader` 异步加载高德地图，初始化后把实例保存到全局，渲染前判断地图是否 ready，卸载时 destroy。业务轨迹用 WKT 的 `POINT/LINESTRING` 表达，再转换成 Marker 和 Polyline 覆盖物。
+
+---
+
+## 18. H5 页面生命周期和状态感知轮询
+
+车辆详情页是一个典型实时 H5 页面。
+
+它需要持续更新：
+
+- 车辆状态。
+- 电量。
+- 异常标签。
+- 当前站点。
+- ETA。
+- 地图位置。
+- 轨迹线。
+- 操作按钮状态。
+
+但不能永远固定轮询。
+
+状态感知逻辑：
+
+```ts
+if (!businessAreaId || !isVisible) return;
+
+if (
+  vehicleStatus === DELIVERYING ||
+  vehicleStatus === PICKING ||
+  vehicleStatus === LOADING ||
+  vehicleStatus === RETURN ||
+  vehicleStatus === MOVING ||
+  vehicleStatus === CORRECT ||
+  vehicleStatus === VACANT
+) {
+  intervalId = setInterval(() => {
+    retrieveRecordDetail();
+  }, 5 * 1000);
+}
+```
+
+可见性来源：
+
+- `visibilitychange`
+- `pageshow`
+- `pagehide`
+- 横竖屏
+- 遥控开始 / 结束
+
+面试回答：
+
+> H5 实时页面不能只写固定轮询。项目里车辆详情页把轮询和页面可见性、车辆业务状态绑定，页面隐藏、横屏、遥控或非关注状态时清掉定时器，恢复后再重新判断是否轮询。这让我理解了移动端 H5 的页面生命周期对请求策略的影响。
+
+---
+
+## 19. H5 中的业务安全和防误触
+
+无人车业务不是普通信息展示，它涉及真实车辆操作，所以前端也要做安全设计。
+
+项目里体现：
+
+- 滑动发车，避免误触。
+- 发车前校验站点、门锁、车厢状态。
+- 发车后轮询调度结果，不把接口返回 requestId 当成功。
+- 操作按钮根据车辆状态禁用。
+- 遥控前检测车辆是否支持遥控。
+- 修改返程点、开关机等操作后刷新详情。
+
+面试回答：
+
+> 这个项目让我意识到业务 H5 前端也要做安全交互设计。比如发车不是一个普通按钮，而是滑动确认；接口返回 requestId 后还要轮询调度状态；车辆操作按钮要根据车辆状态、站点状态和权限动态禁用，避免用户误操作真实设备。
+
+---
+
+## 20. 组件开发经验
+
+项目里常见组件类型：
+
+| 组件类型 | 例子 | 学到 |
+| --- | --- | --- |
+| 页面容器 | `CnPage`、`CnPageFooter` | 移动端页面结构 |
+| 列表项 | `VehicleListItem`、历史任务卡片 | 数据驱动 UI |
+| 底部抽屉 | 站点选择、操作确认 | 移动端交互常用 |
+| 弹窗 | `CnDialog`、异常弹窗 | 二次确认 / 提示 |
+| 时间线 | `TaskTimeline` | 抽象标准 UI 模型 |
+| 地图 | `DeliveryMap` | SDK 生命周期和性能 |
+| 滑块 | `SliderRightButton` | touch 交互 |
+| 骨架屏 | `SkeletonVehicleList` | loading 体验 |
+
+组件开发学到：
+
+- Props 类型要清晰。
+- 业务适配逻辑尽量放 adapter。
+- 复杂组件要拆子组件。
+- 高风险交互要处理 loading / success / failure。
+- 组件卸载要清理副作用。
+- 移动端要考虑安全区和滚动。
+
+---
+
+## 21. Adapter 模式和前端数据建模
+
+路线卡片重构里学到一个重要思想：前端不要让 UI 直接吃各种后端 DTO。
+
+后端可能有：
+
+- 创建任务站点。
+- 运输任务节点。
+- 历史任务站点。
+- 车辆详情当前任务。
+- 发车确认任务节点。
+
+它们字段不完全一样。
+
+所以前端抽出标准模型：
+
+```ts
+interface RouteItem {
+  id: string | number;
+  title: string;
+  description?: string;
+  eta?: string;
+  markerType?: 'dot' | 'start' | 'end' | 'index';
+  pointStatus?: 'done' | 'active' | 'pending' | 'cancel';
+  lineStatus?: 'done' | 'active' | 'pending' | 'cancel';
+  arrowPosition?: 'none' | 'line' | 'point';
+}
+```
+
+不同业务数据通过 adapter 转换：
+
+```txt
+后端 DTO / 历史记录 / 车辆详情 / 发车确认
+  -> adapter
+  -> RouteItem / StepItem
+  -> 统一 UI 组件渲染
+```
+
+面试回答：
+
+> 这个项目让我学到前端也需要数据建模。复杂业务里不同接口返回的节点结构不一致，如果 UI 直接适配每种 DTO，会导致重复逻辑很多。通过 Adapter 把异构数据转成标准 UI 模型，可以复用组件渲染，后续新增状态或样式时改动更集中。
+
+---
+
+## 22. H5 中的缓存
+
+项目里有 SessionStorage 缓存车辆列表：
+
+```ts
+const VEHICLE_LIST_CACHE_KEY = 'vehicleListCache';
+
+sessionStorage.setItem(
+  VEHICLE_LIST_CACHE_KEY,
+  JSON.stringify(vehicleList)
+);
+```
+
+读取：
+
+```ts
+const cachedData = sessionStorage.getItem(VEHICLE_LIST_CACHE_KEY);
+if (cachedData) {
+  const parsedData = JSON.parse(cachedData);
+  setVehicleData(parsedData);
+  setVehicleListLoading(false);
+}
+```
+
+缓存适合：
+
+- 返回列表时快速展示上次数据。
+- 减少白屏。
+- 临时保存页面间状态。
+
+注意：
+
+- 缓存可能过期。
+- 缓存只用于兜底和快速渲染，仍要请求最新数据覆盖。
+- 不适合存敏感信息。
+- WebView storage 可能被清理或隔离。
+
+面试回答：
+
+> H5 缓存主要用于提升体验，不应该完全替代接口。项目里车辆列表写入 SessionStorage，返回页面时可以快速渲染旧数据，再请求最新数据覆盖，避免用户看到长时间白屏。
+
+---
+
+## 23. H5 异常处理和错误边界
+
+项目里请求封装有默认错误处理：
+
+```ts
+export const defaultErrorHandler = (err) => {
+  if (err instanceof Error) {
+    CnMessage.error({ content: '出错啦!' });
+  } else if (err.errorMsg) {
+    CnMessage.error({ content: err.errorMsg });
+  } else {
+    CnMessage.error({ content: '系统异常，请稍后再试。' });
+  }
+};
+```
+
+入口也引入了 ErrorBoundary：
+
+```ts
+import ErrorBoundary from '@alife/cainiao-error-boundary';
+```
+
+虽然当前部分代码被注释，但体现了思路：
+
+- 接口错误要统一提示。
+- JS Runtime Error 最好有 ErrorBoundary。
+- 请求失败要上报日志。
+- 关键业务失败要给用户明确反馈。
+
+面试回答：
+
+> H5 页面在 WebView 里出错后用户很难自助恢复，所以请求层要统一错误处理和日志上报，页面层关键区域可以配 ErrorBoundary，业务操作失败要用 Toast/Dialog 给出明确反馈。
+
+---
+
+## 24. H5 发布和资源缓存理解
+
+从配置里学到：
+
+```ts
+output: {
+  assetPrefix,
+  distPath: {
+    js: `${name}/${version}/js`,
+    css: `${name}/${version}/css`,
+    html: `${name}/html`,
+  },
+  filenameHash: false,
+}
+```
+
+理解：
+
+- JS/CSS 放 CDN。
+- 版本号目录用于缓存隔离。
+- HTML 可能不强缓存，指向当前版本资源。
+- 公共库通过 CDN 外链。
+- source map 单独输出，方便排查问题。
+
+生产配置：
+
+```ts
+new SourceMapDevToolPlugin({
+  filename: 'sourcemaps/[file].map[query]',
+  append: false,
+});
+```
+
+面试回答：
+
+> H5 发布时要考虑 CDN 路径、版本目录和缓存。项目把 JS/CSS 输出到带版本号的目录，HTML 单独输出，source map 也单独生成用于排查线上问题。
+
+---
+
+## 25. H5 开发常见坑：结合项目理解
+
+### 25.1 fixed 底部按钮在 iOS WebView 中异常
+
+项目里发车页有注释：
+
+```tsx
+{/* 确认发车按钮 - 挂到 body，避免 iOS WebView 中 fixed 被 CnPage/地图容器错误锚定 */}
+```
+
+说明：
+
+- iOS WebView 里 fixed 可能受父容器 transform / overflow 影响。
+- 地图容器和页面容器叠加时更容易出问题。
+- 解决方式可能是 portal 到 body 或调整层级。
+
+### 25.2 body 滚动和内部滚动冲突
+
+解决：
+
+- body fixed。
+- 页面内容区滚动。
+- `-webkit-overflow-scrolling: touch`。
+
+### 25.3 页面隐藏后轮询继续跑
+
+解决：
+
+- `visibilitychange`
+- `pagehide/pageshow`
+- cleanup 清定时器。
+
+### 25.4 第三方组件样式被 viewport 转换影响
+
+解决：
+
+```ts
+selectorBlackList: ['.adm-', '.cn-ui-m-']
+```
+
+### 25.5 Bridge 不存在时报错
+
+解决：
+
+```ts
+if (!isFlutterWebView()) {
+  return { code: -1, message: '非 Flutter 容器环境' };
+}
+```
+
+### 25.6 多环境 URL 拼接复杂
+
+解决：
+
+```ts
+const getUnmannedVehicleBaseUrl = () => {
+  if (hostname.includes('localhost')) {
+    return `${window.location.origin}${window.location.pathname}#`;
+  }
+  if (hostname.includes('pre')) {
+    return 'page-pre.cainiao.com/cn-yz/m-unmanned-vehicle#';
+  }
+  return 'page.cainiao.com/cn-yz/m-unmanned-vehicle#';
+};
+```
+
+### 25.7 事件监听 cleanup 要对应
+
+项目里多数地方都有 cleanup，例如详情页移除 `visibilitychange/pagehide/orientationchange`。面试可以讲原则：
+
+> 所有 `addEventListener`、`setInterval`、地图实例、Bridge 事件监听都要在组件卸载或依赖变化时清理，否则 H5 页面返回后容易出现重复请求、重复监听或内存泄漏。
+
+---
+
+## 26. 面试怎么讲“我熟悉 H5 项目开发”
+
+不要只说：
+
+> 我熟悉 H5。
+
+要说具体：
+
+> 我参与的是一个移动端无人车 H5 项目，技术栈是 React 17 + Modern.js + HashRouter + 移动端组件库。这个项目运行在普通浏览器和 App WebView 容器里，所以我接触了很多 H5 特有问题：比如 viewport 和安全区适配、px 转 vw、body 滚动控制、底部 fixed 栏、touch 滑动交互、WebView 生命周期、WindVane / Flutter Bridge、扫码定位电话等原生能力、MTOP 和 REST 请求封装、登录态存储、首屏骨架屏、vConsole 调试、地图 SDK 加载和状态感知轮询。我不是只写静态页面，而是在真实业务链路里处理这些移动端工程问题。
+
+---
+
+## 27. 简历可以怎么写
+
+### 27.1 保守版
+
+```md
+熟悉移动端 H5 项目开发，参与 React + Modern.js 无人车业务 H5 开发，了解 Hash 路由、移动端 vw 适配、iOS 安全区、WebView 生命周期、接口封装、状态管理、骨架屏和原生 Bridge 调用等实践。
+```
+
+### 27.2 稍强版
+
+```md
+熟悉移动端 H5 工程开发：参与无人车 H5 项目核心链路建设，基于 React + Modern.js 实现车辆列表、详情、发车、地图轨迹等页面，实践 Hash 路由、px-to-vw 适配、安全区处理、WindVane / 小程序 / Flutter WebView 容器适配、MTOP / REST 请求封装、Jotai / Rematch 状态管理、首屏骨架屏与移动端调试。
+```
+
+### 27.3 如果简历空间很紧
+
+```md
+了解移动端 H5 工程化开发，熟悉 React H5 页面开发、Hash 路由、vw 适配、WebView Bridge、接口封装、状态管理、骨架屏与移动端性能优化。
+```
+
+---
+
+## 28. 面试高频问题和回答
+
+### Q1：H5 项目和普通 Web 项目有什么区别？
+
+A：
+
+> H5 更关注移动端运行环境。除了写页面，还要适配 WebView、移动端视口、触摸交互、iOS 安全区、页面切后台、锁屏、横竖屏、原生 Bridge、调试和网络环境。普通 PC Web 更关注浏览器桌面端体验，而 H5 要考虑手机容器和系统行为。
+
+### Q2：为什么项目用 HashRouter？
+
+A：
+
+> 因为 H5 静态资源部署在 CDN 上，服务端不一定能为每个前端路由配置 fallback。Hash 路由可以保证所有页面请求的都是同一个 HTML，`#` 后面的路径由前端解析，也更适合 WebView 打开具体业务页。
+
+### Q3：移动端适配怎么做？
+
+A：
+
+> 项目通过 viewport 设置设备宽度和 `viewport-fit=cover`，样式里处理 `env(safe-area-inset-bottom)` 安全区，构建时用 `postcss-px-to-viewport` 以 375 设计稿为基准把 px 转 vw，同时把第三方组件库选择器加入黑名单，避免组件样式被破坏。
+
+### Q4：WebView 里怎么调用原生能力？
+
+A：
+
+> 项目封装了 WindVane 和 Flutter Bridge。底层通过 `window.WindVane.call` 或 `window.flutter_inappwebview.callHandler` 调端能力，上层再封装成 `makePhoneCall`、`scanQRCode`、`getLocation`、`navigateTo` 等语义化方法。调用前要判断环境，失败要降级，避免普通浏览器里直接报错。
+
+### Q5：H5 怎么处理登录态？
+
+A：
+
+> 项目封装了本地存储。普通浏览器用 localStorage，WindVane 环境用 Uni API storage，这样登录态和 token 可以适配不同容器。请求层会自动取 accessToken 放到 Authorization 里。
+
+### Q6：MTOP 和 REST 请求有什么区别？
+
+A：
+
+> 老接口走 MTOP，使用 `request(api, data)`，内部根据 mock、WindVane、普通 H5 选择不同请求方式；新接口走 REST，使用 `httpRequest(url, method, data)`，底层 Axios，自动带 Authorization。两者都统一返回 `{ data, raw }`，调用方可以保持一致。
+
+### Q7：H5 首屏白屏怎么优化？
+
+A：
+
+> 项目用了两层骨架屏。HTML 模板里先加载 `skeleton-loader.js`，在 React 启动前往 `#root-skeleton` 注入静态骨架屏；React 启动后页面根据 loading 展示组件骨架屏。同时公共库走 CDN externals，字体 preload，减少首屏等待。
+
+### Q8：为什么要监听 visibilitychange？
+
+A：
+
+> 移动端用户经常切后台、锁屏或进入其他页面。详情页如果继续轮询，用户看不到更新，请求就是无效的。项目通过 `visibilitychange`、`pagehide/pageshow`、横竖屏和遥控事件维护页面活跃状态，控制轮询启停。
+
+### Q9：地图 H5 有哪些注意点？
+
+A：
+
+> 地图 SDK 是异步加载的，要等 `AMapLoader.load` 完成后再初始化地图和渲染覆盖物。地图实例需要统一管理，组件卸载时 destroy。轨迹数据用 WKT 表示点线，转成 Marker 和 Polyline。轮询场景下还要避免 ETA 文案变化导致整张地图重复 clearMap。
+
+### Q10：你作为实习生从这个项目学到了什么？
+
+A：
+
+> 最大收获是第一次理解真实 H5 项目不是只写页面。它涉及构建配置、路由、移动端适配、WebView 容器、Bridge、登录态、接口封装、状态管理、性能优化、地图 SDK、触摸交互和调试。以前我更多关注 React 组件本身，这个项目让我开始从完整业务链路和移动端运行环境去思考问题。
+
+---
+
+## 29. 可以主动提到的项目细节
+
+面试时你可以主动讲这些，证明不是背概念：
+
+- 项目使用 `HashRouter`，URL 里通过 query 带 `vehicleId / udid / transportId`。
+- `pushWindow` 根据 WindVane / 小程序 / 浏览器分别跳转。
+- `postcss-px-to-viewport` 基准宽度是 375，黑名单有 `.adm-` 和 `.cn-ui-m-`。
+- HTML 里设置了 `viewport-fit=cover` 和 `format-detection`。
+- body 被 fixed，页面内容区自己滚动，减少 iOS 橡皮筋和底部栏问题。
+- React、ReactDOM、`cn-ui-m` 被 externals 到 CDN。
+- 本地开发 dev server 是 HTTPS。
+- devServer 配了 `/vehicle`、`/transport` 等代理。
+- 请求层统一记录耗时、参数、响应和错误。
+- 地图 SDK 用 `AMapLoader.load` 异步加载。
+- 地图卸载时 `Map.destroy()`。
+- 车辆详情轮询结合 `visibilitychange/pagehide/pageshow`。
+- 发车按钮是 `touch` 滑动确认，不是普通 click。
+- 状态管理分 Rematch 和 Jotai。
+- vConsole 只在本地 / 预发 / 日常加载。
+
+---
+
+## 30. 当前项目里也有一些可优化点
+
+面试时如果被问“还有什么不足”，可以讲这些。
+
+### 30.1 部分轮询还可以抽 hook
+
+车辆详情页已经做状态感知轮询，但任务进行中页还有固定 5 秒轮询。后续可以抽：
+
+```ts
+usePageActivity()
+useStateAwarePolling()
+```
+
+复用可见性和状态门控。
+
+### 30.2 setInterval 可以换成递归 setTimeout
+
+`setInterval` 在弱网下可能上一轮未结束下一轮又触发。更稳的是请求锁或递归 `setTimeout`。
+
+### 30.3 部分状态适配可以更集中
+
+车辆状态、任务节点状态散落在多个页面里，后续可以抽枚举映射和 adapter。
+
+### 30.4 Bridge 类型可以更强
+
+WindVane 调用很多是 `any`，后续可以给每个 module/method 定义入参和返回类型。
+
+### 30.5 缓存策略可以更明确
+
+SessionStorage 缓存要有过期时间和版本，避免展示过旧数据。
+
+面试回答：
+
+> 我理解项目是持续演进的。比如状态感知轮询可以抽 hook 复用到更多页面，`setInterval` 可以加请求锁，Bridge 可以补类型，缓存可以加过期策略。这些都是我复盘后觉得可以继续提升的地方。
+
+---
+
+## 31. H5 开发知识清单
+
+离职后复习时，看这张清单。
+
+### 工程
+
+- Modern.js
+- React 17
+- HashRouter
+- route config
+- lazy + Suspense
+- externals
+- CDN assetPrefix
+- devServer proxy
+- source map
+- bundle analyze
+
+### 移动端适配
+
+- viewport
+- viewport-fit=cover
+- safe-area-inset
+- px to vw
+- selectorBlackList
+- normalize.css
+- body fixed
+- page content scroll
+- `-webkit-overflow-scrolling: touch`
+- iOS fixed 问题
+
+### 容器
+
+- WindVane
+- Uni API
+- 小程序 WebView
+- Flutter InAppWebView
+- Bridge 环境判断
+- 原生导航
+- 原生存储
+- 扫码 / 定位 / 电话 / WiFi
+
+### 请求
+
+- MTOP request
+- REST httpRequest
+- Axios
+- Authorization
+- accessToken
+- refresh token
+- mock request
+- dev proxy
+- 请求耗时日志
+- 错误统一处理
+
+### 状态
+
+- Rematch / Redux
+- Jotai atom
+- URL query 恢复状态
+- sessionStorage 缓存
+- 页面 loading
+
+### 性能
+
+- HTML 骨架屏
+- React 骨架屏
+- externals 减包
+- 字体 preload
+- 状态感知轮询
+- 地图 renderKey
+- 避免重复 clearMap
+- 引用复用
+
+### 业务交互
+
+- 滑动确认
+- 二次确认弹窗
+- 状态禁用按钮
+- 下拉刷新
+- 底部操作栏
+- 抽屉选择器
+- 地图大图
+
+### 调试
+
+- vConsole
+- console 请求日志
+- ARMS / goldlog
+- source map
+- 本地 HTTPS
+- useH5=true
+
+---
+
+## 32. 最终复述版本
+
+如果面试官让你讲 H5 项目经验，可以这样说：
+
+> 我实习期间参与了一个无人车移动端 H5 项目，技术栈是 React 17 + Modern.js + HashRouter。这个项目运行在普通浏览器和 App WebView 容器里，所以我接触了比较完整的 H5 工程实践：构建上配置了 CDN assetPrefix、externals、px-to-vw、devServer proxy；入口上配置了 viewport、安全区、骨架屏和 vConsole；页面上用 React Router 管理车辆列表、详情、发车、地图、历史任务等路由；状态上用 Rematch 管全局组织和用户信息，用 Jotai 管无人车业务内的轻量跨页面状态；请求上同时支持 MTOP 和 REST，封装了统一响应结构、token、错误处理和日志；容器能力上封装了 WindVane / 小程序 / Flutter Bridge，用于导航、扫码、定位、电话、WiFi 和遥控。
+>
+> 业务上我重点参与了发车任务、车辆详情、地图轨迹和路线卡片相关开发，也做了状态感知轮询和地图重绘优化。通过这个项目我学到 H5 开发不只是写页面，还要考虑移动端适配、WebView 生命周期、原生能力、首屏性能、触摸交互、调试和真实业务安全性。
+
+---
+
+## 33. 最推荐写进简历的一句话
+
+```md
+熟悉移动端 H5 工程化开发，参与 React + Modern.js 无人车 H5 项目，实践 Hash 路由、vw 移动端适配、iOS 安全区、WebView 生命周期、WindVane / Flutter Bridge、MTOP / REST 请求封装、Jotai / Rematch 状态管理、首屏骨架屏、地图 SDK 接入与移动端性能优化。
+```
+
