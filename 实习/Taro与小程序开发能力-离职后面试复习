@@ -1,0 +1,1622 @@
+# Taro 与小程序开发能力离职后面试复习
+
+## 文档目的
+
+这份文档是为了支撑简历上写：
+
+> 熟悉 Taro、React 小程序开发，具备小程序页面配置、生命周期、路由、登录授权、请求封装、跨端适配、地图定位、扫码取货、订阅消息、隐私协议与埋点可观测性等业务开发经验。
+
+离职后你可能拿不到项目源码，所以这份文档要做到“自包含”：不依赖再打开代码，只靠这里的项目背景、伪代码、知识点和面试问答，就能复盘这段实习经历。
+
+项目背景是一个 `Taro 4 + React 18 + TypeScript` 的取货小程序，业务核心是：用户通过扫码或取件码进入货单，开箱取货，完成取件，并处理登录、订阅提醒、地图展示、隐私协议、接口异常和业务埋点。
+
+---
+
+## 1. 简历可以怎么写
+
+### 1.1 简历技能栏
+
+可以写：
+
+> 熟悉 Taro + React 小程序开发，了解微信/支付宝小程序页面配置、生命周期、路由跳转、登录授权、扫码、订阅消息、地图定位、隐私协议、请求拦截和跨端适配等常见开发场景。
+
+如果想更偏项目：
+
+> 基于 Taro 4 + React 18 参与取货小程序开发，负责/参与页面搭建、公共页面容器封装、登录与路由守卫、扫码取货链路、接口请求封装、车辆分区路由、页面埋点、订阅消息和跨端适配等工作。
+
+### 1.2 项目经历里可以写
+
+> 参与 Taro 小程序取货业务开发，围绕首页扫码、取件码取货、货单列表、订单详情、开箱、完成取件等核心流程，完成页面与交互开发；封装统一页面容器，处理自定义导航栏、安全区、下拉刷新、滚动区域、全局弹窗和 loading；基于 Taro API 实现扫码、登录授权、订阅消息、地图展示、定位权限和跨端平台判断；通过路由管理器、请求拦截器和埋点体系提升小程序链路稳定性与可观测性。
+
+### 1.3 面试 30 秒介绍
+
+这个项目是一个 Taro + React 的取货小程序。我主要接触的是小程序端完整业务链路：从首页扫码或取件码进入货单列表，到开箱、更新订单状态、完成取件，再到订阅提醒和回首页。开发中用到了 Taro 的页面配置、生命周期 Hook、跨端 API、路由跳转、扫码、登录、订阅消息、地图组件、定位权限和请求封装。除此之外，我还参与了公共页面容器和埋点/异常上报体系建设，所以不只是写页面，也理解小程序工程化、链路稳定性和线上排障。
+
+### 1.4 面试 2 分钟介绍
+
+这个项目是一个取货场景的小程序，技术栈是 Taro 4、React 18、TypeScript、Zustand 和自研请求封装。用户有两条主链路：扫码取货和取件码取货。扫码链路会调用 `Taro.scanCode` 获取二维码内容，解析车辆名，再根据手机号查货单；取件码链路会输入 6 位取件码查单。进入货单列表后，用户可以开门取货、开单个格口、一键全开、进入订单详情、完成取件，并在完成后处理订阅提醒。
+
+从 Taro 和小程序开发角度，我做过几类事情：第一是应用与页面配置，比如 `app.config` 里配置页面、分包、权限、隐私相关信息，页面级 `definePageConfig` 配置自定义导航栏、透明标题、禁用页面滚动。第二是生命周期和页面容器，应用启动用 `useLaunch` 初始化用户状态，页面曝光和刷新用 `useDidShow`，公共 `Page`/`PageLayout` 处理安全区、自定义导航栏、滚动区域、下拉刷新、全局弹窗和 loading。第三是小程序能力接入，比如扫码、手机号授权登录、验证码登录、订阅消息、定位权限、地图组件、复制、拨打电话和跳转 web 协议页面。第四是工程化能力，比如统一路由管理、登录守卫、请求拦截、token 刷新队列、跨端平台判断和接口异常上报。
+
+所以我对 Taro 的理解不是只会写 `View`、`Text`、`Button`，而是理解一个真实小程序项目从页面配置、业务链路、跨端 API、状态管理、请求层到线上排障的完整开发方式。
+
+---
+
+## 2. 项目里体现出的 Taro 技术栈
+
+### 2.1 技术栈画像
+
+这个项目可以概括为：
+
+```text
+Taro 4
+  + React 18
+  + TypeScript
+  + Webpack5
+  + Less
+  + Tailwind / weapp-tailwindcss
+  + Zustand
+  + 自研 Request 封装
+  + Taro 小程序 API
+  + 微信/支付宝跨端适配
+```
+
+项目脚本体现：
+
+```json
+{
+  "build": "taro build --type weapp",
+  "build:prod": "taro build --type weapp --mode release",
+  "build:alipay": "taro build --type alipay",
+  "dev": "npm run build -- --watch",
+  "dev:alipay": "npm run build:alipay -- --watch"
+}
+```
+
+面试解释：
+
+> 项目默认构建微信小程序，也保留支付宝等多端构建能力。Taro 的价值是用 React 语法和统一组件/API 写小程序，再由 Taro 编译到不同小程序平台。
+
+### 2.2 Taro 配置理解
+
+项目里的 Taro 配置大概是这样：
+
+```ts
+export default defineConfig(async merge => {
+  const baseConfig = {
+    projectName: 'mini_pick',
+    designWidth: 750,
+    sourceRoot: 'src',
+    outputRoot: 'dist',
+    framework: 'react',
+    compiler: 'webpack5',
+    mini: {
+      postcss: {
+        pxtransform: { enable: true },
+        cssModules: { enable: false },
+      },
+      webpackChain(chain) {
+        chain.resolve.plugin('tsconfig-paths').use(TsconfigPathsPlugin);
+        chain.merge({
+          plugin: {
+            install: {
+              plugin: UnifiedWebpackPluginV5,
+              args: [{ appType: 'taro', rem2rpx: true }],
+            },
+          },
+        });
+      },
+    },
+  };
+
+  if (process.env.NODE_ENV === 'development') {
+    return merge({}, baseConfig, devConfig);
+  }
+
+  return merge({}, baseConfig, prodConfig);
+});
+```
+
+要点：
+
+1. `designWidth: 750`
+   设计稿宽度按 750 处理，方便把设计稿尺寸转换成小程序 rpx。
+
+2. `framework: 'react'`
+   项目使用 React 组件模型。
+
+3. `compiler: 'webpack5'`
+   使用 Webpack5 编译。
+
+4. `sourceRoot: 'src'`
+   源码目录。
+
+5. `outputRoot: 'dist'`
+   小程序构建产物目录。
+
+6. `pxtransform`
+   让样式单位适配小程序尺寸体系。
+
+7. `TsconfigPathsPlugin`
+   支持 `@/xxx` 这种路径别名。
+
+8. `weapp-tailwindcss`
+   支持在小程序里使用 Tailwind 风格的工具类，并做 rem 到 rpx 转换。
+
+面试可说：
+
+> 我理解 Taro 项目不只是写页面，还要理解编译配置。比如设计稿宽度、rpx 转换、路径别名、Webpack 插件、微信/支付宝多端构建，这些都会影响开发效率和产物表现。
+
+---
+
+## 3. 小程序应用配置与页面配置
+
+### 3.1 全局 app.config
+
+项目的全局配置可以抽象成：
+
+```ts
+export default defineAppConfig({
+  pages: [
+    'pages/index/index',
+    'pages/profile/index',
+    'pages/login/index',
+    'pages/code/index',
+    'pages/orderList/index',
+    'pages/orderDetail/index',
+    'pages/orderHistory/index',
+    'pages/phone/index',
+  ],
+
+  subPackages: [
+    {
+      root: 'subpackages/demo',
+      pages: [
+        'pages/index/index',
+        'pages/button/index',
+        'pages/modal/index',
+      ],
+    },
+  ],
+
+  window: {
+    backgroundTextStyle: 'light',
+    navigationBarBackgroundColor: '#fff',
+    navigationBarTitleText: 'zelos',
+    navigationBarTextStyle: 'black',
+  },
+
+  permission: {
+    'scope.userLocation': {
+      desc: '你的位置信息将用于小程序位置接口的效果展示',
+    },
+  },
+
+  requiredPrivateInfos: ['getLocation'],
+});
+```
+
+面试重点：
+
+1. `pages`
+   小程序主包页面列表，页面必须注册后才能跳转。
+
+2. `subPackages`
+   分包配置，通常用于体积优化或 demo/低频页面拆分。小程序主包体积有限，分包能降低首包压力。
+
+3. `window`
+   全局导航栏、标题、背景配置。
+
+4. `permission`
+   配置定位权限文案，用户授权时展示。
+
+5. `requiredPrivateInfos`
+   声明使用 `getLocation` 等隐私接口，符合小程序平台合规要求。
+
+可直接背：
+
+> 小程序开发里 app config 很重要，它决定页面注册、分包、导航栏、权限和隐私接口声明。像定位这种能力，不只是代码里调用 `getLocation`，还要在配置里声明权限用途。
+
+### 3.2 页面级 definePageConfig
+
+项目页面配置常见形态：
+
+```ts
+export default definePageConfig({
+  navigationBarTitleText: '',
+  navigationStyle: 'custom',
+  disableScroll: true,
+  transparentTitle: 'always',
+  titlePenetrate: 'YES',
+});
+```
+
+字段解释：
+
+1. `navigationStyle: 'custom'`
+   使用自定义导航栏。项目里很多页面都有统一的自定义顶部栏、安全区和返回按钮，因此隐藏原生导航。
+
+2. `disableScroll: true`
+   禁用页面原生滚动，让页面内部用 `ScrollView` 控制滚动区域，常见于需要固定头部/底部的页面。
+
+3. `transparentTitle: 'always'`
+   导航标题透明，配合沉浸式头图或自定义导航。
+
+4. `titlePenetrate: 'YES'`
+   支付宝小程序相关配置，处理透明标题区域穿透。
+
+面试可说：
+
+> 我们项目里很多页面用自定义导航栏，所以页面配置会设置 `navigationStyle: custom`。然后在公共 `Page` 组件里自己处理安全区、返回按钮、标题、滚动区域和底部固定按钮。这比每个页面单独处理更统一。
+
+---
+
+## 4. Taro 生命周期：项目里怎么用
+
+### 4.1 应用启动 useLaunch
+
+应用启动伪代码：
+
+```tsx
+function App({ children }) {
+  const refetch = useUserStore(state => state.refetch);
+
+  useLaunch(options => {
+    refetch();
+  });
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ZEMProvider client={zemClient}>
+        {children}
+      </ZEMProvider>
+    </QueryClientProvider>
+  );
+}
+```
+
+说明：
+
+1. `useLaunch` 对应小程序 `onLaunch`。
+2. 项目在启动时恢复用户登录态。
+3. 如果用户已有 token，会拉取当前用户信息并做身份绑定。
+4. 根组件包了查询客户端和埋点 Provider。
+
+面试可答：
+
+> `useLaunch` 是应用级生命周期，适合做启动初始化，比如恢复登录态、初始化全局状态、埋点 SDK 上下文等。
+
+### 4.2 页面显示 useDidShow
+
+项目里大量使用 `useDidShow`：
+
+```ts
+useDidShow(() => {
+  getList(params);
+});
+```
+
+或：
+
+```ts
+useDidShow(() => {
+  trackPageView(router.path, title, {
+    ...router.params,
+    _track_from: lastPath,
+  });
+});
+```
+
+为什么不用普通 `useEffect`：
+
+1. 小程序页面栈会缓存页面。
+2. 从详情页返回列表页时，列表页不一定重新挂载。
+3. `useEffect` 只覆盖 React 挂载，不一定覆盖“小程序重新显示”。
+4. `useDidShow` 更适合刷新数据、页面曝光、订阅状态检查。
+
+面试可背：
+
+> 小程序页面有自己的生命周期，和普通 Web React 不完全一样。比如页面返回显示时不一定重新 mount，所以我会用 `useDidShow` 处理页面曝光、数据刷新、订阅状态检查这类“每次显示都要做”的事情。
+
+### 4.3 下拉刷新
+
+项目公共 `Page` 组件里用 `ScrollView` 的 refresher 能力：
+
+```tsx
+<ScrollView
+  scrollY
+  enhanced
+  bounces={false}
+  refresherEnabled={enablePullDownRefresh}
+  refresherTriggered={refresherTriggered}
+  onRefresherRefresh={handlePullDownRefresh}
+>
+  {children}
+</ScrollView>
+```
+
+刷新逻辑：
+
+```ts
+async function handlePullDownRefresh() {
+  if (!enablePullDownRefresh || !onPullDownRefresh) return;
+
+  setRefresherTriggered(true);
+
+  try {
+    await Promise.resolve(onPullDownRefresh());
+  } finally {
+    setTimeout(() => {
+      setRefresherTriggered(false);
+    }, 200);
+  }
+}
+```
+
+面试要点：
+
+1. 下拉刷新可以用页面原生配置，也可以在 `ScrollView` 里做。
+2. 项目因为有自定义页面容器和固定底部，用 `ScrollView` 统一控制滚动和刷新。
+3. `refresherTriggered` 要手动控制，否则刷新状态可能收不回。
+
+---
+
+## 5. Taro 组件和小程序组件体系
+
+### 5.1 常用基础组件
+
+项目里常见 Taro 组件：
+
+```tsx
+import { View, Text, Image, ScrollView, Map } from '@tarojs/components';
+```
+
+对应理解：
+
+1. `View`
+   类似 Web 的 `div`，小程序布局容器。
+
+2. `Text`
+   文本组件，文字内容建议放在 `Text` 里。
+
+3. `Image`
+   图片组件，支持 `mode` 等小程序图片属性。
+
+4. `ScrollView`
+   可滚动容器，适合自定义页面滚动、下拉刷新。
+
+5. `Map`
+   地图组件，用于订单详情展示车辆和停靠点。
+
+6. `Button`
+   项目里封装了自己的 `Button`，但仍然会透传小程序 `openType` 等能力。
+
+### 5.2 自定义页面容器 Page
+
+项目公共 `Page` 做了这些能力：
+
+```text
+Page
+  -> 自定义导航栏
+  -> 顶部安全区 SafeAreaPlaceholder
+  -> 返回按钮
+  -> 标题和左右插槽
+  -> 内容滚动 ScrollView
+  -> 下拉刷新
+  -> 底部固定区域
+  -> 底部安全区
+  -> 全局 loading
+  -> 全局 alert
+  -> 全局 confirm modal
+  -> ErrorBoundary
+  -> portal 区域
+```
+
+伪代码：
+
+```tsx
+function Page({
+  title,
+  showBack,
+  leftContent,
+  rightContent,
+  bottomContent,
+  loading,
+  enablePullDownRefresh,
+  onPullDownRefresh,
+  children,
+}) {
+  return (
+    <PageProvider>
+      <View className="page h-screen flex flex-col">
+        <SafeAreaPlaceholder top />
+
+        <View className="navbar">
+          {leftContent || (showBack && <BackButton />)}
+          <View>{title}</View>
+          {rightContent}
+        </View>
+
+        <ScrollView
+          scrollY
+          refresherEnabled={enablePullDownRefresh}
+          onRefresherRefresh={onPullDownRefresh}
+        >
+          <ErrorBoundary>{children}</ErrorBoundary>
+        </ScrollView>
+
+        {bottomContent && (
+          <View className="bottom">
+            {bottomContent}
+            <SafeAreaPlaceholder bottom />
+          </View>
+        )}
+
+        {loading && <Loading />}
+        <GlobalConfirmModal />
+      </View>
+    </PageProvider>
+  );
+}
+```
+
+面试可说：
+
+> 我们不是每个页面单独写导航栏和滚动区域，而是封装了公共 Page。它统一处理安全区、滚动、下拉刷新、底部固定按钮、loading、弹窗和错误边界。这是小程序工程化里很重要的一部分，因为小程序页面经常需要自定义导航和适配不同机型安全区。
+
+### 5.3 自定义导航栏和安全区
+
+为什么需要安全区：
+
+1. iPhone 刘海屏、底部 Home Indicator。
+2. 微信/支付宝小程序导航栏高度和胶囊按钮区域不同。
+3. 自定义导航栏时必须自己补顶部安全区域。
+
+项目做法：
+
+```tsx
+<SafeAreaPlaceholder top backgroundColor={headerBackground} />
+<View className="navbar">...</View>
+...
+<SafeAreaPlaceholder bottom backgroundColor={bottomBackground} />
+```
+
+面试回答：
+
+> 因为项目用了 `navigationStyle: custom`，所以原生导航栏不再兜底。我们需要自己处理顶部安全区、返回按钮、标题，以及底部固定操作栏的安全区，避免内容被状态栏或底部手势区域遮挡。
+
+---
+
+## 6. 路由管理：Taro 跳转和项目封装
+
+### 6.1 Taro 原生路由 API
+
+小程序常见路由：
+
+```ts
+Taro.navigateTo({ url: '/pages/orderDetail/index?orderId=1' });
+Taro.redirectTo({ url: '/pages/login/index' });
+Taro.reLaunch({ url: '/pages/index/index' });
+Taro.switchTab({ url: '/pages/index/index' });
+Taro.navigateBack({ delta: 1 });
+```
+
+区别：
+
+1. `navigateTo`
+   保留当前页面，打开新页面。适合列表到详情。
+
+2. `redirectTo`
+   关闭当前页面，跳到新页面。适合登录页内部替换。
+
+3. `reLaunch`
+   清空页面栈，打开新页面。适合完成取件后回首页。
+
+4. `switchTab`
+   跳转 tab 页。
+
+5. `navigateBack`
+   返回页面栈中的上一页。
+
+### 6.2 项目路由封装
+
+项目没有到处直接用 Taro 路由，而是封装了 `RouterManager`：
+
+```ts
+class RouterManager {
+  async navigateTo(options) {
+    return this.navigate({ ...options, type: 'navigateTo' });
+  }
+
+  async reLaunch(options) {
+    return this.navigate({ ...options, type: 'reLaunch' });
+  }
+
+  private async navigate(options) {
+    const fullUrl = buildUrl(options.url, options.params);
+    const guardResult = await this.executeRouteGuard(options);
+
+    if (!guardResult.allowed) {
+      if (guardResult.redirectTo) {
+        return this.performNavigation({
+          url: guardResult.redirectTo,
+          type: 'navigateTo',
+        });
+      }
+      showToast('无权限访问');
+      throw new Error('无权限访问');
+    }
+
+    await this.performNavigation({
+      url: fullUrl,
+      type: options.type,
+    });
+
+    this.addToHistory(options.url, options.params);
+  }
+}
+```
+
+项目路由做了：
+
+1. 统一参数拼接。
+2. 统一登录守卫。
+3. 统一权限判断。
+4. 支持登录前页面记录。
+5. 支持路由历史记录。
+6. 支持不同跳转类型。
+
+### 6.3 参数拼接和解析
+
+伪代码：
+
+```ts
+function paramsToQuery(params) {
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => {
+      return `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`;
+    })
+    .join('&');
+}
+
+function buildUrl(path, params) {
+  const query = paramsToQuery(params);
+  return query ? `${path}?${query}` : path;
+}
+```
+
+为什么重要：
+
+1. 小程序路由参数都是 query 字符串。
+2. 参数要编码，避免中文、特殊字符出错。
+3. 要过滤 `undefined/null/空字符串`，避免脏参数。
+
+### 6.4 页面参数读取
+
+Taro 里页面读取参数：
+
+```ts
+const { params } = useRouter<{
+  vehicleName: string;
+  verifyCode: string;
+  mobileNumber: string;
+  type: string;
+}>();
+```
+
+面试可说：
+
+> Taro 页面参数通过 `useRouter` 读取。项目里会把扫码入口和取件码入口都带到货单列表，比如 `type=PHONE` 或 `type=CODE`，列表页再根据 type 决定用手机号查单还是取件码查单。
+
+---
+
+## 7. 登录授权与用户状态
+
+### 7.1 微信手机号授权登录
+
+项目里微信快捷登录逻辑：
+
+```tsx
+<Button
+  openType="getPhoneNumber"
+  onGetPhoneNumber={handleGetPhoneNumber}
+>
+  手机号快捷登录
+</Button>
+```
+
+伪代码：
+
+```ts
+async function handleGetPhoneNumber(e) {
+  trackClick('手机号授权登录');
+
+  if (e.detail.errMsg !== 'getPhoneNumber:ok') {
+    return;
+  }
+
+  await agreementRef.current.validate();
+
+  Taro.login({
+    success: res => {
+      const login_code = res.code;
+      const phone_number_code = e.detail.code;
+
+      ssoManager.login('wx_mini_app_authorization_code', {
+        login_code,
+        phone_number_code,
+      });
+    },
+  });
+}
+```
+
+要点：
+
+1. `openType="getPhoneNumber"` 是小程序手机号授权能力。
+2. 需要用户点击按钮触发，不能静默获取。
+3. `Taro.login()` 拿临时登录 code。
+4. `e.detail.code` 是手机号授权 code。
+5. 前端把两个 code 交给后端/SSO 换 token。
+6. 登录前要校验用户协议和隐私协议。
+
+### 7.2 支付宝登录适配
+
+项目里支付宝走不同 API：
+
+```ts
+if (isAlipay) {
+  my.getAuthCode({
+    scopes: 'auth_user',
+    success: authRes => {
+      my.getPhoneNumber({
+        success: phoneRes => {
+          ssoManager.login('zfb_mini_app_authorization_code', {
+            login_code: authRes.authCode,
+            phone_number_response: phoneRes.response,
+          });
+        },
+      });
+    },
+  });
+}
+```
+
+面试要点：
+
+1. Taro 能抹平很多 API，但不是所有平台能力都完全一致。
+2. 支付宝有时需要直接调用 `my.xxx`。
+3. 所以项目里用 `process.env.TARO_ENV` 判断平台。
+
+```ts
+export const platform = process.env.TARO_ENV;
+export const isAlipay = platform === 'alipay';
+export const isWeapp = platform === 'weapp';
+```
+
+### 7.3 登录态恢复
+
+应用启动：
+
+```ts
+useLaunch(() => {
+  useUserStore.getState().refetch();
+});
+```
+
+用户 store 逻辑：
+
+```ts
+async function refetch() {
+  if (!ssoManager.isLogin()) {
+    set({ isAuthenticated: false });
+    return;
+  }
+
+  await handleLoginSuccess();
+}
+
+async function handleLoginSuccess() {
+  const user = await getCurrentUser();
+
+  zemClient.identify({
+    userId: user.id,
+    userName: user.username,
+  });
+
+  set({
+    user,
+    isAuthenticated: true,
+  });
+}
+```
+
+面试可说：
+
+> 登录态不是只在登录页处理，应用启动时也要恢复。项目里启动后检查 SSO token，如果已登录就拉当前用户信息，并更新 Zustand 状态。
+
+---
+
+## 8. 请求封装与小程序网络开发
+
+### 8.1 为什么要封装 Taro.request
+
+直接写：
+
+```ts
+Taro.request({
+  url,
+  method: 'POST',
+  data,
+});
+```
+
+问题：
+
+1. 每个接口都要拼 baseURL。
+2. 每个接口都要处理 token。
+3. 每个接口都要判断 HTTP 状态。
+4. 每个接口都要判断业务成功。
+5. 错误提示、异常上报、重试逻辑容易重复。
+
+所以项目封装了 `Request`：
+
+```ts
+class Request {
+  defaults = {
+    method: 'GET',
+    timeout: 10000,
+    headers: {
+      'Content-Type': 'application/json',
+      'fe-project': 'miniPick_weapp',
+    },
+  };
+
+  interceptors = {
+    request: new InterceptorManager(),
+    response: new InterceptorManager(),
+  };
+
+  async request(config) {
+    let mergedConfig = mergeConfig(this.defaults, config);
+    mergedConfig = await runRequestInterceptors(mergedConfig);
+
+    const response = await Taro.request({
+      url: buildFullUrl(mergedConfig),
+      method: mergedConfig.method,
+      data: mergedConfig.data,
+      header: mergedConfig.headers,
+      timeout: mergedConfig.timeout,
+    });
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new RequestError(response.statusCode);
+    }
+
+    response.config = mergedConfig;
+    return runResponseInterceptors(response);
+  }
+}
+```
+
+面试可说：
+
+> Taro.request 是底层能力，真实项目会封装请求实例，统一 baseURL、headers、token、超时、HTTP 错误、业务错误和拦截器。这样页面只关心业务逻辑。
+
+### 8.2 token 请求拦截
+
+伪代码：
+
+```ts
+request.interceptors.request.use(config => {
+  const accessToken = ssoManager.getAccessToken();
+
+  if (!accessToken) {
+    saveCurrentPageAndGoToLogin();
+    throw new Error('No access token');
+  }
+
+  config.headers.Authorization = `Bearer ${accessToken}`;
+  return config;
+});
+```
+
+面试要点：
+
+1. 请求前统一加 `Authorization`。
+2. 没 token 时保存当前页并跳登录。
+3. 页面不用自己判断 token。
+
+### 8.3 token 刷新队列
+
+项目里考虑了并发刷新：
+
+```ts
+let isRefreshing = false;
+let refreshPromise = null;
+let failedQueue = [];
+
+async function responseInterceptor(response) {
+  const authPass = await ssoManager.checkResponse(response);
+  if (authPass) return response;
+
+  if (response.originalConfig._retry) {
+    onTokenRefreshFailed();
+    throw response;
+  }
+
+  if (isRefreshing) {
+    return new Promise((resolve, reject) => {
+      failedQueue.push({ resolve, reject, config: response.originalConfig });
+    });
+  }
+
+  response.originalConfig._retry = true;
+  isRefreshing = true;
+
+  try {
+    await ssoManager.renewToken();
+    processQueue(null, ssoManager.getAccessToken());
+    return request(response.originalConfig);
+  } catch (error) {
+    processQueue(error, null);
+    onTokenRefreshFailed();
+    throw error;
+  } finally {
+    isRefreshing = false;
+  }
+}
+```
+
+为什么重要：
+
+1. 多个请求同时发现 token 过期时，不能每个请求都刷新一次。
+2. 第一个请求负责刷新。
+3. 其他请求进入队列等待。
+4. 刷新成功后队列里的请求继续。
+5. 刷新失败统一跳登录/首页。
+
+面试可说：
+
+> 我理解请求封装里的并发问题。token 过期时，如果多个请求同时回来，应该用刷新锁和队列避免重复刷新 token，这也是小程序网络层稳定性的一个细节。
+
+### 8.4 业务成功和 HTTP 成功要区分
+
+伪代码：
+
+```ts
+function responseFulfilled(response) {
+  const { success, isSuccess, data, message, errorCode } = response.data;
+
+  if (success || isSuccess) {
+    return data;
+  }
+
+  showToast({ title: message, icon: 'none' });
+  reportServerException({ message, errorCode });
+
+  throw new ServerError(message, errorCode);
+}
+```
+
+面试可说：
+
+> 小程序里很多接口 HTTP 是 200，但业务不一定成功，所以响应拦截器不能只看 `statusCode`，还要看业务字段，比如 `success/isSuccess`。
+
+---
+
+## 9. 扫码取货：Taro.scanCode
+
+项目扫码入口伪代码：
+
+```ts
+async function handleScan(mobileNumber) {
+  if (!mobileNumber) {
+    navigateTo('/pages/login/index');
+    return;
+  }
+
+  Taro.scanCode({
+    onlyFromCamera: true,
+    scanType: 'QR_CODE',
+    success: async res => {
+      const vehicleName =
+        getQueryVariable(res.result, 'vehicleName') ||
+        getQueryVariable(res.result, 'vehicle_name') ||
+        (await getZelosVehicleName(res.result)).name;
+
+      clearVehiclePartitionCache();
+
+      const orderResult = await getOrderByPhone(vehicleName, mobileNumber);
+      const orderList = orderResult.dispatch.orderList || [];
+
+      if (!orderList.length) {
+        showToast({ title: '暂无货单信息', icon: 'none' });
+        return;
+      }
+
+      navigateTo('/pages/orderList/index', {
+        type: 'PHONE',
+        vehicleName,
+        mobileNumber,
+      });
+    },
+    fail: error => {
+      console.log('扫码失败', error);
+    },
+  });
+}
+```
+
+要点：
+
+1. `onlyFromCamera: true`
+   只允许相机扫码，不从相册选。
+
+2. `scanType: 'QR_CODE'`
+   限定二维码类型。
+
+3. 扫码结果是字符串，需要解析 query。
+
+4. 二维码可能不是标准参数，所以有兜底接口 `getZelosVehicleName`。
+
+5. 扫码前/查单前清车辆分区缓存，避免上一辆车影响下一辆车。
+
+面试回答：
+
+> 扫码不是扫完就结束。项目里扫码后要解析车辆名，再根据手机号查货单，然后带 `type=PHONE`、`vehicleName`、`mobileNumber` 跳到货单列表。这里还要处理未登录、扫码失败、二维码格式不一致、无货单和车辆分区缓存。
+
+---
+
+## 10. 取件码输入和免登录链路
+
+取件码链路伪代码：
+
+```ts
+async function handleConfirmCode(verifyCode) {
+  if (verifyCode.length !== 6) return;
+
+  setLoading(true);
+
+  try {
+    clearVehiclePartitionCache();
+
+    const res = await getOrderByCode(verifyCode);
+    const orderList = res.dispatch.orderList || [];
+
+    if (!orderList.length) {
+      showToast({ title: '暂无货单信息', icon: 'none' });
+      return;
+    }
+
+    const firstOrder = orderList[0];
+
+    zemClient.identify({
+      userId: '',
+      userName: firstOrder.name,
+    });
+
+    navigateTo('/pages/orderList/index', {
+      type: 'CODE',
+      vehicleName: res.name,
+      verifyCode,
+    });
+  } finally {
+    setLoading(false);
+  }
+}
+```
+
+要点：
+
+1. 取件码是免登录链路。
+2. 输入长度限制为 6 位。
+3. 查单成功后进入货单列表。
+4. 列表页根据 `type=CODE` 再用取件码查单。
+5. 免登录场景没有 userId，可以用货单里的收件人做弱身份。
+
+面试可说：
+
+> 这个项目不是所有取货都要求登录，取件码是免登录入口。所以小程序开发里要支持登录态和非登录态两套链路，并在列表页通过路由参数 `type` 区分查单方式。
+
+---
+
+## 11. 开箱、状态更新和完成取件
+
+### 11.1 开箱链路
+
+伪代码：
+
+```ts
+async function handleOpenBox(vehicleName, gridNos, orderIds, autoOpen) {
+  try {
+    startCountdown();
+
+    await openBox(vehicleName, gridNos, autoOpen);
+
+    await updateStatus(vehicleName, orderIds);
+  } catch (error) {
+    stopCountdown();
+    console.error('开箱失败', error);
+  }
+}
+```
+
+业务解释：
+
+1. `openBox`
+   发送开箱指令。
+
+2. `updateStatus`
+   更新订单状态为已取/待完成状态。
+
+3. `startCountdown`
+   开箱后完成取件按钮有倒计时限制，避免用户过早点完成。
+
+4. `autoOpen`
+   区分自动开箱和手动开箱。
+
+面试可说：
+
+> 我理解用户点击和业务完成不是一回事。开箱链路至少包括发送开箱指令和更新订单状态两个接口，所以排查“门没打开”时也要拆开看。
+
+### 11.2 自动开箱
+
+项目里有自动开箱策略：
+
+```ts
+useEffect(() => {
+  if (type === 'MESSAGE' && !isFlatCar) {
+    return;
+  }
+
+  if (vehicleName && autoOpen) {
+    orderList.forEach(order => {
+      if (order.orderStatus !== 'PICKED') {
+        handleOpenBox(vehicleName, order.gridNo.split(','), [order.id], true);
+      }
+    });
+  }
+
+  if (!autoOpen && orderList.length === 1) {
+    const order = orderList[0];
+    const grids = order.gridNo.split(',');
+
+    if (grids.length === 1 && order.orderStatus !== 'PICKED') {
+      handleOpenBox(vehicleName, grids, [order.id], true);
+    }
+  }
+}, [orderList, autoOpen, vehicleName, type]);
+```
+
+要点：
+
+1. 某些车辆/业务配置支持自动开箱。
+2. 如果只有一个订单一个格口，也可以自动开。
+3. 消息入口可能不自动开箱，避免用户只是从消息查看详情就触发开箱。
+4. 平板车有特殊逻辑。
+
+### 11.3 完成取件和订阅提醒
+
+伪代码：
+
+```ts
+async function handleConfirmComplete(vehicleName, orderList) {
+  const orderIds = orderList.map(order => order.id);
+
+  await batchCompletePick(vehicleName, orderIds);
+
+  if (registered && shouldShowSubscribeConfirm) {
+    showSubscribeModal();
+  } else {
+    reLaunch('/pages/index/index');
+  }
+}
+```
+
+订阅消息：
+
+```ts
+Taro.requestSubscribeMessage({
+  tmplIds: [CODE_TEMP_ID, VEHICLE_TEMP_ID],
+  entityIds: [CODE_TEMP_ID, VEHICLE_TEMP_ID],
+  success(res) {
+    logger.info('requestSubscribeMessageSuccess', res);
+  },
+  fail(res) {
+    logger.info('requestSubscribeMessageFail', res);
+  },
+  complete(res) {
+    logger.info('requestSubscribeMessageComplete', res);
+    reLaunch('/pages/index/index');
+  },
+});
+```
+
+面试要点：
+
+1. 订阅消息必须由用户动作触发。
+2. 要先判断用户订阅设置。
+3. 要处理 success、fail、complete。
+4. complete 里做收尾跳转更稳。
+
+---
+
+## 12. 地图、定位和权限
+
+### 12.1 app.config 权限声明
+
+```ts
+permission: {
+  'scope.userLocation': {
+    desc: '你的位置信息将用于小程序位置接口的效果展示',
+  },
+},
+requiredPrivateInfos: ['getLocation'],
+```
+
+说明：
+
+> 小程序使用定位能力时，不能只写 `Taro.getLocation`，还要在配置中声明权限用途和隐私接口。
+
+### 12.2 定位权限流程
+
+伪代码：
+
+```ts
+async function getCurrentLocation() {
+  const setting = await Taro.getSetting();
+  const hasPermission = setting.authSetting['scope.userLocation'] === true;
+
+  if (!hasPermission) {
+    try {
+      await Taro.authorize({ scope: 'scope.userLocation' });
+    } catch {
+      const result = await Taro.showModal({
+        title: '定位权限',
+        content: '需要获取您的位置信息，请在设置中开启定位权限',
+        confirmText: '去设置',
+      });
+
+      if (result.confirm) {
+        await Taro.openSetting();
+      } else {
+        throw new Error('用户拒绝定位权限');
+      }
+    }
+  }
+
+  return Taro.getLocation({
+    type: 'gcj02',
+    isHighAccuracy: false,
+  });
+}
+```
+
+要点：
+
+1. `Taro.getSetting` 检查授权状态。
+2. `Taro.authorize` 主动申请权限。
+3. 用户拒绝后用 `Taro.showModal` 引导。
+4. `Taro.openSetting` 打开设置页。
+5. `Taro.getLocation` 获取经纬度。
+6. `type: 'gcj02'` 适配高德地图坐标系。
+
+### 12.3 地图组件封装
+
+伪代码：
+
+```tsx
+function BaseMap({
+  longitude,
+  latitude,
+  markers,
+  polyline,
+  onCenterChange,
+}) {
+  const [innerLongitude, setInnerLongitude] = useState(116.397428);
+  const [innerLatitude, setInnerLatitude] = useState(39.90923);
+
+  function handleRegionChange(e) {
+    if (e.type !== 'end') return;
+    if (e.causedBy !== 'drag') return;
+
+    const center = e.detail.centerLocation;
+    setInnerLongitude(center.longitude);
+    setInnerLatitude(center.latitude);
+    onCenterChange?.(center.longitude, center.latitude);
+  }
+
+  return (
+    <Map
+      longitude={longitude ?? innerLongitude}
+      latitude={latitude ?? innerLatitude}
+      markers={markers}
+      polyline={polyline}
+      enableZoom
+      enableScroll
+      onRegionChange={handleRegionChange}
+    />
+  );
+}
+```
+
+订单详情页地图展示：
+
+```text
+地图中心点：
+  优先用停靠点经纬度
+  没有就用默认经纬度
+
+markers：
+  停靠点 marker
+  车辆 marker
+
+polyline：
+  后端返回路径点
+  转成地图 polyline points
+```
+
+面试可说：
+
+> 我接触过小程序地图组件，知道 markers、polyline、longitude、latitude、onRegionChange 这些属性，也处理过默认中心点、拖拽中心点变化和车辆/站点标记展示。
+
+---
+
+## 13. 隐私协议与用户协议
+
+项目里登录前需要同意协议。
+
+伪代码：
+
+```tsx
+const AgreementCheckbox = forwardRef((props, ref) => {
+  const [checked, setChecked] = useState(false);
+  const [modalVisible, setModalVisible] = useState(false);
+  const [pendingPromise, setPendingPromise] = useState(null);
+
+  useImperativeHandle(ref, () => ({
+    validate() {
+      return new Promise((resolve, reject) => {
+        if (checked) {
+          resolve();
+        } else {
+          setPendingPromise({ resolve, reject });
+          setModalVisible(true);
+        }
+      });
+    },
+  }));
+
+  function handleAgree() {
+    setChecked(true);
+    pendingPromise?.resolve();
+  }
+
+  return (
+    <>
+      <Checkbox checked={checked} onChange={setChecked}>
+        我已阅读并同意
+        <Text onClick={openUserAgreement}>《用户协议》</Text>
+        <Text onClick={openPrivacyPolicy}>《隐私协议》</Text>
+      </Checkbox>
+
+      <AgreeModal visible={modalVisible} onAgree={handleAgree} />
+    </>
+  );
+});
+```
+
+协议跳转：
+
+```ts
+function openPrivacyPolicy(e) {
+  e.stopPropagation();
+  e.preventDefault();
+
+  navigateTo({
+    url: `/pages/file/index?url=${encodeURIComponent(PRIVACY_POLICY_URL)}`,
+  });
+}
+```
+
+要点：
+
+1. 登录前必须校验协议。
+2. 用 `forwardRef + useImperativeHandle` 暴露 `validate()`。
+3. 未勾选时弹确认弹窗。
+4. 点击协议文字要 `stopPropagation/preventDefault`，避免触发 checkbox。
+5. 协议 URL 要 `encodeURIComponent` 后放进路由参数。
+
+面试可说：
+
+> 这个项目让我熟悉小程序合规相关开发，比如登录前协议勾选、隐私协议更新弹窗、协议页面跳转，以及定位权限和隐私接口声明。
+
+---
+
+## 14. 微信和支付宝跨端适配
+
+### 14.1 平台判断
+
+```ts
+export const platform = process.env.TARO_ENV;
+export const isAlipay = platform === 'alipay';
+export const isWeapp = platform === 'weapp';
+```
+
+### 14.2 哪些地方需要跨端适配
+
+1. 登录授权
+   - 微信：`Taro.login + openType=getPhoneNumber`
+   - 支付宝：`my.getAuthCode + my.getPhoneNumber`
+
+2. 返回按钮
+   - 项目里支付宝某些页面不显示自定义返回按钮，或样式边距不同。
+
+3. 订阅消息
+   - 微信小程序用 `Taro.requestSubscribeMessage`。
+
+4. 扫码结果
+   - 微信通过 `res.errMsg === 'scanCode:ok'` 判断。
+   - 支付宝扫码返回结构和错误信息可能不同。
+
+5. 跳转其他小程序
+   - 微信：`Taro.navigateToMiniProgram`
+   - 支付宝：`my.navigateToMiniProgram`
+
+面试可说：
+
+> Taro 能提供跨端能力，但真实项目里微信和支付宝仍然会有 API 差异，所以要用 `process.env.TARO_ENV` 做平台判断。比如手机号授权和跳转其他小程序，支付宝端就需要直接用 `my.xxx`。
+
+---
+
+## 15. 状态管理：Zustand 在小程序里的使用
+
+项目里用 Zustand 管用户状态：
+
+```ts
+const useUserStore = create((set, get) => ({
+  user: null,
+  isAuthenticated: ssoManager.isLogin(),
+  isLoading: false,
+
+  refetch: async () => {
+    if (!ssoManager.isLogin()) {
+      set({ isAuthenticated: false });
+      return;
+    }
+
+    await get().handleLoginSuccess();
+  },
+
+  handleLoginSuccess: async () => {
+    set({ isLoading: true });
+
+    try {
+      const user = await getCurrentUser();
+      set({ user, isAuthenticated: true });
+    } finally {
+      set({ isLoading: false });
+    }
+  },
+
+  handleLogout: () => {
+    set({
+      user: null,
+      isAuthenticated: false,
+    });
+  },
+}));
+```
+
+项目里还用 Zustand 管：
+
+1. 用户状态。
+2. 倒计时状态。
+3. 全局弹窗。
+4. 全局提示。
+
+面试可说：
+
+> 小程序里页面之间也需要共享状态，比如登录用户、倒计时、全局弹窗。这个项目用了 Zustand，优点是轻量，页面可以直接通过 Hook 获取状态，也可以在非组件逻辑里通过 `getState()` 访问。
+
+---
+
+## 16. 取货项目完整业务链路伪代码
+
+### 16.1 扫码取货链路
+
+```text
+App useLaunch
+  -> 恢复登录态
+  -> 绑定用户身份
+
+首页 PageLayout useDidShow
+  -> 页面曝光
+
+点击“扫一扫取货”
+  -> trackClick
+  -> 判断 mobileNumber
+  -> 未登录跳登录
+  -> 已登录 Taro.scanCode
+
+扫码成功
+  -> 解析 vehicleName
+  -> clearVehiclePartitionCache
+  -> getOrderByPhone(vehicleName, mobileNumber)
+  -> 有单 navigateTo(orderList, type=PHONE)
+
+货单列表 useDidShow
+  -> 根据 type=PHONE 查单
+  -> getSetting/checkWxMiniappRegisted
+  -> 判断 autoOpen
+
+开箱
+  -> 点击开门/开格口/一键全开
+  -> openBox
+  -> updateStatus
+  -> 倒计时控制完成按钮
+
+完成取件
+  -> 点击完成取件
+  -> 确认弹窗
+  -> batchCompletePick
+  -> 订阅消息
+  -> reLaunch 首页
+```
+
+### 16.2 取件码取货链路
+
+```text
+首页点击“取件码取货”
+  -> navigateTo(code)
+
+取件码页
+  -> 输入 6 位取件码
+  -> 点击确认
+  -> clearVehiclePartitionCache
+  -> getOrderByCode
+  -> 绑定弱身份
+  -> navigateTo(orderList, type=CODE)
+
+货单列表
+  -> 根据 type=CODE 再用 verifyCode 查单
+  -> 后续开箱/完成取件同扫码链路
+```
+
+---
+
+## 17. 面试高频问题
+
+### Q1：Taro 是什么？为什么用 Taro？
+
+A：Taro 是一个多端统一开发框架，可以用 React/Vue 等语法开发小程序、H5 等多端应用。这个项目用 Taro + React 写小程序，主要价值是组件化开发、工程化能力强、API 相对统一，并保留微信/支付宝多端构建能力。
+
+### Q2：Taro 和原生小程序有什么区别？
+
+A：原生小程序用 WXML/WXSS/JS/JSON，Taro 项目用 React 组件和 TypeScript 写页面，再编译成小程序产物。Taro 提供 `@tarojs/components` 和 `@tarojs/taro` API，但底层仍然要理解小程序页面栈、生命周期、授权、路由和平台限制。
+
+### Q3：你用过哪些 Taro 生命周期？
+
+A：用过 `useLaunch` 做应用启动初始化，比如恢复登录态；用过 `useDidShow` 做页面显示时的数据刷新和页面曝光。项目里没有只依赖 React `useEffect`，因为小程序页面返回时不一定重新挂载。
+
+### Q4：为什么页面曝光用 useDidShow？
+
+A：因为小程序页面栈会缓存页面，从详情返回列表时列表页可能不会重新 mount，但会触发 show。曝光、刷新、订阅状态检查这种“每次页面显示都要做”的逻辑更适合 `useDidShow`。
+
+### Q5：小程序路由有哪些方式？
+
+A：常见有 `navigateTo`、`redirectTo`、`reLaunch`、`switchTab`、`navigateBack`。项目里封装了路由管理器，统一参数拼接、登录守卫、权限判断和路由历史。
+
+### Q6：小程序怎么传页面参数？
+
+A：通过 URL query 传参，比如 `/pages/orderList/index?type=PHONE&vehicleName=xxx`。Taro 页面里用 `useRouter()` 读取 `params`。项目里还封装了 `buildUrl`，统一做参数过滤和 `encodeURIComponent`。
+
+### Q7：你怎么处理登录授权？
+
+A：微信端用 `Button openType=getPhoneNumber` 获取手机号授权 code，再用 `Taro.login` 获取登录 code，交给 SSO 换 token。支付宝端用 `my.getAuthCode` 和 `my.getPhoneNumber`。登录前会先校验协议勾选。
+
+### Q8：请求层你做了什么？
+
+A：封装了基于 `Taro.request` 的 Request 类，支持默认配置、baseURL、headers、请求/响应拦截器、HTTP 非 2xx 处理、业务错误处理、网络异常处理、token 注入和 token 刷新队列。
+
+### Q9：token 过期怎么处理？
+
+A：响应拦截器里判断 token 是否过期，过期后调用 `renewToken`。为了避免多个请求同时刷新，用 `isRefreshing + refreshPromise + failedQueue` 做刷新锁和请求队列。刷新成功后重放队列请求，失败就跳登录或首页。
+
+### Q10：小程序扫码怎么做？
+
+A：用 `Taro.scanCode`。项目里设置 `onlyFromCamera` 和 `scanType=QR_CODE`，扫码成功后解析二维码里的车辆名，再调用查单接口并跳转货单列表。
+
+### Q11：小程序订阅消息怎么做？
+
+A：用 `Taro.requestSubscribeMessage`，传模板 ID。订阅必须由用户动作触发，所以项目在完成取件确认后触发订阅申请，并记录 success/fail/complete，complete 里做回首页收尾。
+
+### Q12：定位权限怎么处理？
+
+A：先在 app config 里声明 `permission` 和 `requiredPrivateInfos`。运行时用 `Taro.getSetting` 检查权限，没权限用 `Taro.authorize` 申请；如果用户拒绝，用 `Taro.showModal` 引导 `Taro.openSetting`；最后用 `Taro.getLocation` 获取位置。
+
+### Q13：地图组件用过吗？
+
+A：用过 Taro 的 `Map` 组件。项目订单详情页用地图展示停靠点、车辆 marker 和路线 polyline，还封装了 `BaseMap` 处理默认中心点、拖拽中心变化和地图事件。
+
+### Q14：如何做微信和支付宝适配？
+
+A：通过 `process.env.TARO_ENV` 判断平台。大部分 Taro API 可以复用，但登录、跳转其他小程序、部分样式和导航栏细节需要区分微信和支付宝，有时支付宝要直接用 `my.xxx`。
+
+### Q15：自定义导航栏要注意什么？
+
+A：页面配置要设置 `navigationStyle: custom`，然后自己处理顶部安全区、返回按钮、标题、左右插槽。还要考虑不同平台、状态栏高度、底部安全区和页面滚动区域。
+
+### Q16：为什么用 ScrollView 而不是页面原生滚动？
+
+A：项目需要统一页面容器、固定底部按钮、自定义下拉刷新和安全区，所以用 `ScrollView` 控制内容滚动。这样底部完成取件按钮可以固定，内容区域独立滚动。
+
+### Q17：小程序开发里你踩过/理解哪些坑？
+
+A：几个典型点：页面返回不重新 mount，所以要用 `useDidShow`；路由参数要编码；自定义导航栏要处理安全区；订阅消息必须用户动作触发；授权失败后要引导 openSetting；微信和支付宝 API 不完全一致；HTTP 200 不代表业务成功；token 刷新要避免并发重复刷新。
+
+---
+
+## 18. 可以主动说的项目亮点
+
+### 亮点 1：不是只会写页面，而是理解完整小程序链路
+
+> 我接触的是从首页扫码、取件码输入、货单列表、订单详情、开箱、完成取件到订阅提醒的完整链路，所以对小程序页面、路由、接口、状态和平台能力都有实际经验。
+
+### 亮点 2：有公共页面容器意识
+
+> 项目封装了公共 Page/PageLayout，统一处理自定义导航栏、安全区、滚动、下拉刷新、loading、全局弹窗和页面曝光，减少页面重复代码。
+
+### 亮点 3：理解小程序生命周期和 Web React 的差异
+
+> 我知道小程序页面栈会缓存页面，所以页面刷新和曝光不能只依赖 `useEffect`，需要用 `useDidShow`。
+
+### 亮点 4：有跨端适配经验
+
+> 项目支持微信和支付宝，实际处理过平台判断、微信手机号授权、支付宝授权、订阅消息、跳转其他小程序等差异。
+
+### 亮点 5：有工程化和稳定性意识
+
+> 除了页面开发，我还理解请求拦截、token 刷新队列、车辆分区路由、接口异常上报和埋点可观测性。
+
+---
+
+## 19. 不要夸大的地方
+
+### 1. 不要说“精通 Taro”
+
+更稳妥：
+
+> 熟悉 Taro 小程序业务开发，能独立完成页面、路由、请求、生命周期和常见小程序 API 接入。
+
+### 2. 不要说“所有多端完全兼容”
+
+更稳妥：
+
+> 项目保留微信和支付宝构建能力，我实际理解并处理过部分平台差异，比如登录授权、订阅消息和小程序跳转。
+
+### 3. 不要说“自研了完整框架”
+
+更稳妥：
+
+> 我参与/理解了项目中的路由、请求、页面容器等工程化封装，并能讲清楚它们解决的问题。
+
+### 4. 不要说“所有小程序 API 都用过”
+
+更稳妥：
+
+> 我实际接触过扫码、登录授权、订阅消息、定位、地图、路由、存储、toast/modal、拨打电话、复制等常用 API。
+
+---
+
+## 20. 最后总结
+
+这段经历可以包装成：
+
+> 我在真实取货业务中系统接触了 Taro 小程序开发。这个项目不是简单页面，而是包含扫码、登录授权、取件码、货单列表、订单详情、地图、开箱、完成取件、订阅消息、隐私协议、请求封装、路由守卫、跨端适配和埋点排障的完整小程序。通过这个项目，我熟悉了 Taro 的 React 开发模式、小程序生命周期、页面配置、路由跳转、常用平台 API 和小程序工程化实践。
+
+最稳的一句话：
+
+> 我熟悉 Taro 小程序开发，不只是会写组件页面，也理解小程序生命周期、路由、授权、请求、跨端适配和真实业务链路里的工程化问题。
