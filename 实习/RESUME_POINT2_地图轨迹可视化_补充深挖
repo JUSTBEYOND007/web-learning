@@ -1,0 +1,1003 @@
+# 简历第二点补充深挖：地图轨迹优化 / 可视化稳定性
+
+> 目标：这份文档服务于离职后复盘和面试。重点解释简历里的“地图轨迹优化”到底优化了什么、为什么会重复渲染、怎么用代码控制重绘和视野调整，以及如何把接口坐标稳定地渲染到移动端地图上。
+>
+> 对应简历点：地图轨迹优化：针对轮询刷新导致地图重复渲染和视野抖动的问题，封装车辆定位、站点编号及已行驶 / 未行驶路线渲染能力，仅在轨迹数据有效变化时更新地图，并控制视野自动调整的时机，减少约 30% - 40% 的无效重绘，提升移动端地图浏览稳定性。
+
+---
+
+## 0. 一句话项目定位
+
+这是无人车 H5 里的通用地图轨迹组件。它把后端返回的车辆位置、站点位置、规划路线、历史路线转换成 WKT，再通过高德 AMap SDK 渲染成车辆 Marker、站点编号 Marker、起终点 Marker 和路线 Polyline。优化重点不是“能画出来”，而是“在轮询刷新下不要反复清图、不要让地图视野跟着 ETA 文案变化乱跳”。
+
+核心文件：
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| 通用地图组件 | `src/pages/UnmannedVehicleNew/components/DeliveryMap/index.tsx` | 接收 `TrajectoryInfo`，渲染覆盖物，控制重绘和视野 |
+| 地图初始化 | `src/pages/UnmannedVehicleNew/components/DeliveryMap/useMapInitialize.ts` | 异步加载 AMap SDK，初始化地图实例 |
+| 覆盖物样式 | `src/pages/UnmannedVehicleNew/components/DeliveryMap/utils.tsx` | 注册路线、站点、车辆、起终点样式 |
+| 车辆 Marker | `src/pages/UnmannedVehicleNew/components/DeliveryMap/CarMarker.tsx` | 车辆图标、朝向、ETA 气泡 |
+| 地图适配层 | `src/vendors/alife-yz-map-next/index.ts` | `wktToOverlay`、`Map` 包装、JSX 转 HTML |
+| 车辆详情页 | `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/index.tsx` | 轮询车辆 / 运输详情，组装轨迹数据 |
+| 独立地图页 | `src/pages/UnmannedVehicleNew/Vehicle/MapView/index.tsx` | 当前车辆定位、地图居中、路线展示 |
+| 发车任务页 | `src/pages/UnmannedVehicleNew/Vehicle/CreateRecordMap/index.tsx` | 发车前算路预览轨迹 |
+| 任务进行中页 | `src/pages/UnmannedVehicleNew/Vehicle/TaskProgress/index.tsx` | 发车成功后展示实时轨迹 |
+| 轨迹类型定义 | `src/services/unmannedVehicleNew/types.ts` | `TrajectoryInfo`、`RouteStatus`、`StaStatus`、`CarStatus` |
+
+---
+
+## 1. 面试版讲法
+
+### 1.1 30 秒版本
+
+我负责无人车 H5 的地图轨迹可视化优化。原来的问题是车辆详情页会轮询刷新，ETA、停靠时长、气泡文案这些字段频繁变化，导致地图组件不断 `clearMap`、重画覆盖物、重新 `setFitView`，用户看地图时会抖动。我把轨迹数据抽象成 `TrajectoryInfo`，父页面只负责把接口坐标转成 WKT，地图组件统一把 WKT 转成 AMap 覆盖物。同时我加了 `trajectoryRenderKey`，只比较真正影响地图几何的字段，比如路线 path、站点 wkt、车辆 wkt、车辆朝向；文案变化不触发重绘。视野也只在首次或路线真正变化时自动调整，从而减少了大量无效重绘，移动端浏览稳定性明显提升。
+
+### 1.2 3 分钟版本
+
+业务上，地图会出现在车辆详情页、发车规划页、任务进行中页和独立地图页。不同页面的数据来源不同：发车规划页来自 `/dispatch/preview`，任务中和详情页来自 `/transport/detail`，但最后都要画同一类元素：车辆、站点、起终点、规划路线和历史路线。所以我把地图输入统一成 `TrajectoryInfo[]`，里面包含 `carPoints`、`staPoints`、`routes`、`startPoint`、`endPoint`。
+
+坐标转换放在父页面做：后端返回 `lng/lat` 数组，父页面拼成 `LINESTRING(lng lat,...)`；站点和车辆坐标拼成 `POINT(lng lat)`。地图组件只关心 WKT，不关心接口字段来自哪里。组件内部通过 `wktToOverlay` 把 `POINT` 转成 AMap Marker，把 `LINESTRING` 转成 AMap Polyline；再通过 `addOverlayConfig` 统一配置颜色和 zIndex，比如已行驶路线灰色、未行驶派送路线蓝色、未行驶揽收路线绿色。
+
+优化主要在 `DeliveryMap`。以前只要 `trajectoryInfo` 引用变化，就会清图重绘并自动调整视野。但车辆详情页轮询时，很多变化只是 ETA 或“停靠时长 10 分钟”这类文案，几何并没有变。于是我写了 `getTrajectoryRenderKey`，只把会影响地图绘制的字段序列化：路线 path/status、站点 wkt/status/type、车辆 wkt/status/angle、起终点 wkt。每次 effect 里比较新旧 key，如果没有变化且已经 fitView 过，就直接 return。组件外层还用 `React.memo` 自定义比较，忽略 `graphBubbleInfo.promptText` 这类高频变化。这样在轮询场景下可以避免不必要的 `clearMap -> renderOverlays -> setFitView`。
+
+视野控制也做了收敛：`setFitView` 只在首次绘制或真正路线变化时触发，避免用户手动拖动地图后又被轮询拉回全局视野。独立地图页传入 `center` 时，还做了约 10 米阈值判断，GPS 小范围漂移不重新居中，减少视野抖动。
+
+---
+
+## 2. 问题背景：为什么地图会抖、会重复渲染
+
+车辆详情和任务进行中页面会频繁刷新：
+
+- `queryVehicleList` 更新车辆状态、电量、异常、车辆当前位置。
+- `queryTransportDetail` 更新运输详情、路线、ETA、实际到达时间、停靠时长。
+- 地图气泡文案可能每次轮询都变，比如“停靠时长 9 分钟 30 秒”。
+- 后端即使返回的路线几何没变，前端也会拿到新的对象引用。
+
+如果地图组件只写成：
+
+```ts
+useEffect(() => {
+  clearMap();
+  renderOverlays(trajectoryInfo);
+  setFitView();
+}, [trajectoryInfo]);
+```
+
+会出现三个问题：
+
+1. 重复清图重绘：路线没变也重新创建大量 Marker / Polyline。
+2. 视野抖动：用户手动拖动地图后，轮询又触发 `setFitView` 把视野拉回去。
+3. 移动端性能差：高德覆盖物不走 React Virtual DOM diff，全量销毁和重建成本较高。
+
+所以这个简历点的核心不是“接了地图 SDK”，而是“在轮询场景下建立地图渲染的有效变化判断”。
+
+---
+
+## 3. 统一数据模型：TrajectoryInfo
+
+类型在 `src/services/unmannedVehicleNew/types.ts`：
+
+```ts
+export enum StaStatus {
+  NotArrived = 0,
+  Arrived = 1,
+}
+
+export interface StationPosition {
+  wkt: string;
+  staId: number | string;
+  status?: StaStatus;
+  staColor?: string;
+  eta: string;
+  type?: string;
+  staName?: string;
+}
+
+export enum CarStatus {
+  Free = 0,
+  Waiting = 1,
+  Driving = 2,
+}
+
+export interface CarPosition {
+  wkt: string;
+  vehicleId: string;
+  status: CarStatus;
+  etaAtNextSta: string;
+  vehicleImgUrl?: string;
+  angle?: number;
+  markerType?: string;
+}
+
+export enum RouteStatus {
+  NotPassed_POST = 0,
+  Passed = 1,
+  NotPassed_PICK = 2,
+}
+
+export interface RouteInfo {
+  subRecordId?: string;
+  path: string;
+  status?: RouteStatus;
+  color?: string;
+}
+
+export interface TrajectoryInfo {
+  showButtons?: string[];
+  staPoints?: StationPosition[];
+  carPoints?: CarPosition[];
+  routes?: RouteInfo[];
+  endPoint?: { wkt: string };
+  startPoint?: { wkt: string };
+}
+```
+
+这套模型把地图元素拆成几类：
+
+| 字段 | 地图含义 | WKT 类型 |
+|------|----------|----------|
+| `staPoints` | 站点编号 Marker | `POINT` |
+| `carPoints` | 车辆 Marker / 当前车图标 | `POINT` |
+| `routes` | 路线 Polyline | `LINESTRING` |
+| `startPoint` | 起点 Marker | `POINT` |
+| `endPoint` | 终点 Marker | `POINT` |
+| `showButtons` | 地图上业务按钮显示控制 | 非几何字段 |
+
+设计好处：
+
+- 父页面不需要知道地图内部怎么画 Marker / Polyline。
+- 地图组件不需要知道接口原始结构。
+- 多个页面可以复用同一个地图组件。
+- 后续优化可以集中在 `TrajectoryInfo` 的有效变化判断上。
+
+---
+
+## 4. WKT：坐标和地图 SDK 的中间层
+
+WKT 规则：
+
+```txt
+点：POINT(lng lat)
+线：LINESTRING(lng1 lat1,lng2 lat2,lng3 lat3)
+```
+
+注意：一定是经度在前、纬度在后，也就是 `${lng} ${lat}`。
+
+### 4.1 发车规划页：preview 结果转 WKT
+
+`CreateRecordMap` 调用 `/dispatch/preview` 后：
+
+```ts
+const routes = utpAutoportPlans
+  .filter(item => item?.planPath?.length > 0)
+  .map(item => {
+    return {
+      path: `LINESTRING(${item.planPath
+        .map(subItem => `${subItem?.lng} ${subItem?.lat}`)
+        .join(',')})`
+    };
+  });
+
+const validStaPoints = utpAutoportPlans
+  .slice(0, -1)
+  .filter(item => item?.utpAutoportLoc?.lng && item?.utpAutoportLoc?.lat)
+  .map((item) => {
+    const estimateArriveTime = formatLocalClock(item?.estimateArriveTime);
+    return {
+      staId: item?.utpAutoportId,
+      eta: estimateArriveTime ? `${estimateArriveTime}预计到达` : '',
+      wkt: `POINT(${item.utpAutoportLoc.lng} ${item.utpAutoportLoc.lat})`,
+      status: 0,
+      type: "POST_POINT"
+    };
+  });
+
+const newInfo = [{
+  staPoints: validStaPoints,
+  startPoint,
+  endPoint,
+  routes
+}];
+
+setTrackInfo(newInfo);
+```
+
+这里会过滤掉没有 `planPath` 的路线和没有坐标的站点，避免地图渲染空覆盖物。
+
+### 4.2 车辆详情页：运输详情转双轨迹
+
+`DetailMap` 里：
+
+```ts
+const routes = [];
+transportAutoports.forEach(item => {
+  item?.planPath && routes.push({
+    path: `LINESTRING(${item?.planPath
+      ?.map(subItem => `${subItem?.lng} ${subItem?.lat}`)
+      .join(',')})`,
+    status: 0
+  });
+  item?.historyPath && routes.push({
+    path: `LINESTRING(${item?.historyPath
+      ?.map(subItem => `${subItem?.lng} ${subItem?.lat}`)
+      .join(',')})`,
+    status: 1
+  });
+});
+```
+
+`status=0` 表示未行驶规划路线，`status=1` 表示已行驶历史路线。地图样式由 `route-line-${status}` 决定。
+
+站点：
+
+```ts
+const newInfo = [{
+  staPoints: transportAutoports?.map(item => {
+    const estimateArriveTime = formatLocalClock(item?.estimateArriveTime);
+    return {
+      staId: item?.utpAutoportId,
+      eta: estimateArriveTime ? `${estimateArriveTime}预计到达` : '',
+      wkt: `POINT(${item?.utpAutoportLoc?.lng} ${item?.utpAutoportLoc?.lat})`,
+      status: 0,
+      type: "POST_POINT"
+    };
+  }),
+  endPoint: {
+    wkt: `POINT(${transportAutoports[transportAutoports?.length - 1]?.utpAutoportLoc?.lng} ${transportAutoports[transportAutoports?.length - 1]?.utpAutoportLoc?.lat})`
+  },
+  routes
+}];
+
+setTrackInfo(prev => isEqual(prev, newInfo) ? prev : newInfo);
+```
+
+最后一行很关键：父页面先用 `isEqual` 拦截一次，如果轨迹数据深度相等，就复用旧 state，避免把相同数据继续传给地图组件。
+
+### 4.3 独立地图页：当前车辆定位
+
+`MapView` 里如果接口返回 `nowLoc`：
+
+```ts
+vehiclePoint = {
+  wkt: `POINT(${nowLoc.lng} ${nowLoc.lat})`,
+  vehicleId: String(udid),
+  status: CarStatus.Driving,
+  etaAtNextSta: '',
+  vehicleImgUrl: VEHICLE_MARKER_PNG_URL,
+  angle: nowLoc.heading || 0,
+  markerType: 'car-marker-current',
+};
+
+setMapCenter([nowLoc.lng, nowLoc.lat]);
+```
+
+车辆图标还带了 `angle`，`CarMarker` 里会按朝向旋转图标。
+
+---
+
+## 5. 地图初始化和生命周期
+
+`useMapInitialize`：
+
+```ts
+export const useMapInitialize = (id: string) => {
+  const [mapReady, setMapReady] = useState(false);
+
+  useEffect(() => {
+    AMapLoader.load({
+      key: AMapConfig.key,
+      version: AMapConfig.version,
+    }).then(async (AMap) => {
+      (window as any).AMap = AMap;
+      (window as any)._amap_instance = null;
+
+      await initializeMap(id, {
+        zoom: 12,
+        zooms: [4, 20],
+        mapStyle: 'amap://styles/whitesmoke',
+      });
+
+      setMapReady(true);
+    });
+
+    return () => {
+      Map.destroy();
+    };
+  }, [id]);
+
+  return mapReady;
+};
+```
+
+为什么要 `mapReady`：
+
+- AMap SDK 是异步加载的。
+- SDK 和地图实例没准备好时，`wktToOverlay` 无法创建 Marker / Polyline。
+- `DeliveryMap` 的渲染 effect 先判断 `mapInitialized`，避免提前渲染失败。
+
+为什么卸载时 `Map.destroy()`：
+
+- 地图实例内部持有 DOM、事件监听、覆盖物对象。
+- H5 多页面切换时如果不销毁，可能造成内存泄漏和旧地图实例残留。
+
+---
+
+## 6. WKT 到 AMap 覆盖物
+
+本地地图适配层 `src/vendors/alife-yz-map-next/index.ts` 提供：
+
+```ts
+export function wktToOverlay(
+  wkt: string,
+  id: string,
+  data: any,
+  type: string,
+  customOptions?: any
+): any { ... }
+```
+
+### 6.1 POINT 转 Marker
+
+```ts
+const pointMatch = wkt.match(/POINT\s*\(\s*([\d.]+)\s+([\d.]+)\s*\)/i);
+if (pointMatch) {
+  const lng = parseFloat(pointMatch[1]);
+  const lat = parseFloat(pointMatch[2]);
+
+  const marker = new AMap.Marker({
+    position: [lng, lat],
+    zIndex: config.zIndex || 100,
+    offset: config.offset ? new AMap.Pixel(config.offset[0], config.offset[1]) : undefined,
+    anchor: config.anchor as any,
+    content: config.content,
+  });
+
+  marker._data = data;
+  marker._id = id;
+  return marker;
+}
+```
+
+### 6.2 LINESTRING 转 Polyline
+
+```ts
+const lineMatch = wkt.match(/LINESTRING\s*\(([^)]+)\)/i);
+if (lineMatch) {
+  const coords = lineMatch[1].split(',').map((coord) => {
+    const [lng, lat] = coord.trim().split(/\s+/);
+    return [parseFloat(lng), parseFloat(lat)];
+  });
+
+  const polyline = new AMap.Polyline({
+    path: coords,
+    strokeColor: polylineConfig.strokeColor || '#1890ff',
+    strokeWeight: polylineConfig.strokeWeight || 6,
+    strokeOpacity: polylineConfig.strokeOpacity || 1,
+    borderWeight: polylineConfig.borderWeight || 2,
+    isOutline: polylineConfig.isOutline || true,
+    outlineColor: polylineConfig.outlineColor || '#808080',
+    lineCap: polylineConfig.lineCap || 'round',
+    lineJoin: polylineConfig.lineJoin || 'round',
+    zIndex: polylineConfig.zIndex || 100,
+  });
+
+  return polyline;
+}
+```
+
+面试可以这样讲：WKT 是前端内部协议，父页面统一生成，地图适配层统一解析，这样业务页面不用直接依赖 AMap Marker / Polyline 构造参数。
+
+---
+
+## 7. 覆盖物样式：路线、站点、车辆分层
+
+`addOverlayConfig` 注册所有覆盖物样式。
+
+路线：
+
+```ts
+Polyline.config.addConfig(`route-line-${RouteStatus.Passed}`, {
+  strokeColor: '#C0C0C0',
+  outlineColor: '#808080',
+  zIndex: 100,
+  ...comonLineConfig,
+});
+
+Polyline.config.addConfig(`route-line-${RouteStatus.NotPassed_POST}`, {
+  strokeColor: '#82B1FF',
+  outlineColor: '#2B67ED',
+  zIndex: 99,
+  ...comonLineConfig,
+});
+
+Polyline.config.addConfig(`route-line-${RouteStatus.NotPassed_PICK}`, {
+  strokeColor: '#D6FCF5',
+  outlineColor: '#0DA48A',
+  zIndex: 98,
+  ...comonLineConfig,
+});
+```
+
+颜色含义：
+
+| status | 枚举 | 样式 | 含义 |
+|--------|------|------|------|
+| `1` | `RouteStatus.Passed` | 灰色 | 已行驶历史路径 |
+| `0` | `RouteStatus.NotPassed_POST` | 蓝色 | 未行驶派送路线 |
+| `2` | `RouteStatus.NotPassed_PICK` | 绿色 | 未行驶揽收路线 |
+
+站点 / 车辆：
+
+```ts
+Marker.config.addConfig('sta-marker-no', {
+  zIndex: 201,
+  anchor: 'center',
+  cursor: 'pointer',
+});
+
+Marker.config.addConfig('car-marker-normal', {
+  zIndex: 202,
+  offset: [5, 0],
+});
+
+Marker.config.addConfig('car-marker-current', {
+  zIndex: 203,
+  anchor: 'center',
+  offset: [0, 0],
+});
+```
+
+zIndex 分层：
+
+| 覆盖物 | zIndex | 原因 |
+|--------|--------|------|
+| 路线 Polyline | 98-100 | 放底层，避免遮挡站点 |
+| 站点编号 / 起终点 | 201 | 压在线上方 |
+| 普通车辆 Marker | 202 | 压过站点 |
+| 当前车辆 Marker | 203 | 独立地图页当前车辆最突出 |
+
+---
+
+## 8. 核心渲染：renderOverlays
+
+`DeliveryMap` 的渲染函数：
+
+```ts
+const renderOverlays = (data: TrajectoryInfo[]) => {
+  const $map = Map.getInstance();
+
+  const overlaysArr = data.map((item) => {
+    const {
+      carPoints = [],
+      routes = [],
+      staPoints = [],
+      endPoint,
+      startPoint,
+    } = item;
+
+    ...
+  });
+
+  overlaysArr.filter(Boolean).forEach((overlays) => {
+    overlays.filter(Boolean).forEach((overlay) => {
+      $map.add(overlay);
+    });
+  });
+};
+```
+
+### 8.1 站点编号 Marker
+
+```ts
+const staNoMarkers = staPoints
+  .filter((o) => Boolean(o?.wkt))
+  .map((staPoint, index) => {
+    return wktToOverlay(
+      staPoint.wkt,
+      `${staPoint.staId}_${index}`,
+      staPoint,
+      'sta-marker-no',
+      (staPoint.type || StopOverPointType.PICK_POINT) === StopOverPointType.PICK_POINT
+        ? { content: `<span ... color: #097562 ...>${index + 1}</span>` }
+        : { content: `<span ... color: #005be5 ...>${index + 1}</span>` }
+    );
+  });
+```
+
+这里按站点类型区分编号颜色：
+
+- `PICK_POINT`：绿色系，表示揽收。
+- 其他任务点：蓝色系，表示派送 / 途经。
+
+### 8.2 车辆 Marker
+
+```ts
+const carMarker = carPoints
+  .filter((o) => Boolean(o?.wkt))
+  .map((carPoint) => {
+    return wktToOverlay(
+      carPoint.wkt,
+      carPoint.vehicleId,
+      carPoint,
+      carPoint.markerType ||
+        `car-marker-${carPoint.status === CarStatus.Driving ? 'normal' : 'offset'}`,
+      {
+        content: transformJsxToHtml(<CarMarker data={carPoint} />),
+      }
+    );
+  });
+```
+
+`CarMarker` 是 React 组件，但高德 Marker 的 `content` 要 HTML 字符串，所以用：
+
+```ts
+transformJsxToHtml(<CarMarker data={carPoint} />)
+```
+
+适配层内部用 `ReactDOMServer.renderToStaticMarkup` 转成字符串。这是 React 和非 React 地图 SDK 的桥接。
+
+车辆朝向：
+
+```tsx
+transform: `translate(-50%, -50%) rotate(${markerAngle + 130}deg)`
+```
+
+`angle` 来自 `nowLoc.heading` 或 `vehiclePoseVO.heading`。
+
+### 8.3 路线 Polyline
+
+```ts
+const routeLines = routes
+  .filter((o) => Boolean(o?.path))
+  .map((route, index) => {
+    return wktToOverlay(
+      route.path,
+      route.subRecordId || `route-line-${route.status}-${index}`,
+      route,
+      `route-line-${route.status}`
+    );
+  });
+```
+
+通过 `route.status` 拼样式 key，渲染逻辑不写死颜色，颜色都在 `addOverlayConfig` 管。
+
+---
+
+## 9. 最核心优化：trajectoryRenderKey
+
+### 9.1 为什么不能直接比较整个 trajectoryInfo
+
+`trajectoryInfo` 里可能有很多字段：
+
+- 会影响几何渲染：`wkt`、`path`、`status`、`angle`、`markerType`。
+- 不影响几何渲染：ETA 文案、气泡提示、按钮文案、停靠时长。
+
+如果直接把整个对象作为 effect 依赖或深比较，会导致文案变化也触发地图重绘。
+
+### 9.2 只提取几何字段
+
+`DeliveryMap` 里：
+
+```ts
+const getTrajectoryRenderKey = (data?: TrajectoryInfo[]) => {
+  if (isEmpty(data)) return '';
+
+  return JSON.stringify(
+    data?.map((item) => ({
+      carPoints: item.carPoints?.map((point) => ({
+        wkt: getRenderWkt(point.wkt),
+        vehicleId: point.vehicleId,
+        status: point.status,
+        markerType: point.markerType,
+        vehicleImgUrl: point.vehicleImgUrl,
+        angle: point.angle,
+      })),
+      routes: item.routes?.map((route) => ({
+        path: getRenderWkt(route.path),
+        status: route.status,
+        subRecordId: route.subRecordId,
+      })),
+      staPoints: item.staPoints?.map((point) => ({
+        staId: point.staId,
+        wkt: getRenderWkt(point.wkt),
+        status: point.status,
+        type: point.type,
+      })),
+      endPoint: {
+        wkt: getRenderWkt(item.endPoint?.wkt),
+      },
+      startPoint: {
+        wkt: getRenderWkt(item.startPoint?.wkt),
+      },
+    }))
+  );
+};
+```
+
+刻意没有纳入：
+
+- `staPoint.eta`
+- `graphBubbleInfo.promptText`
+- 其他纯文案字段
+
+这就是减少无效重绘的核心。
+
+### 9.3 effect 中跳过重绘
+
+```ts
+const prevTrajectoryRenderKeyRef = useRef<string>();
+const hasFitViewRef = useRef(false);
+
+useEffect(() => {
+  if (!mapInitialized) return;
+  if (isEmpty(trajectoryInfo)) return;
+
+  showButtons(trajectoryInfo);
+
+  const $map = Map.getInstance();
+  if (!$map) return;
+
+  const trajectoryRenderKey = getTrajectoryRenderKey(trajectoryInfo);
+  const trajectoryChanged =
+    trajectoryRenderKey !== prevTrajectoryRenderKeyRef.current;
+  prevTrajectoryRenderKeyRef.current = trajectoryRenderKey;
+
+  if (!trajectoryChanged && hasFitViewRef.current) {
+    return;
+  }
+
+  addOverlayConfig();
+  $map.clearMap();
+  renderOverlays(trajectoryInfo);
+  const overlays = $map?.getAllOverlays()?.filter(Boolean);
+  if (overlays?.length > 0) {
+    if (!hasFitViewRef.current) {
+      $map.setFitView(overlays);
+      hasFitViewRef.current = true;
+    }
+  }
+}, [mapInitialized, trajectoryInfo]);
+```
+
+这段逻辑可以拆成两层判断：
+
+1. `trajectoryChanged === false` 且已经自动调整过视野：直接跳过。
+2. 轨迹真的变了：清图、重绘，但 `setFitView` 只在首次做。
+
+当前代码注释写得很直白：
+
+```ts
+// 只比较影响地图几何渲染的字段，避免 ETA/文案轮询变化触发清图重绘
+// 数据没有实质变化，跳过重绘
+// 只在首次或路线真正变化时 setFitView，避免反复调整视野导致抖动
+```
+
+面试时可以直接围绕这三句话展开。
+
+---
+
+## 10. React.memo：组件层再拦一次
+
+`DeliveryMap` 外层用了 `React.memo` 自定义比较：
+
+```ts
+export default React.memo(DeliveryMap, (prevProps, nextProps) => {
+  if (prevProps.loading !== nextProps.loading) return false;
+  if (prevProps.className !== nextProps.className) return false;
+  if (prevProps.onReturnToExpress !== nextProps.onReturnToExpress) return false;
+  if (
+    getTrajectoryRenderKey(prevProps.trajectoryInfo) !==
+    getTrajectoryRenderKey(nextProps.trajectoryInfo)
+  ) {
+    return false;
+  }
+
+  const prevCenter = prevProps.center;
+  const nextCenter = nextProps.center;
+  if (prevCenter && nextCenter) {
+    const threshold = 0.0001;
+    if (
+      Math.abs(prevCenter[0] - nextCenter[0]) >= threshold ||
+      Math.abs(prevCenter[1] - nextCenter[1]) >= threshold
+    ) {
+      return false;
+    }
+  } else if (prevCenter !== nextCenter) {
+    return false;
+  }
+  return true;
+});
+```
+
+注释里说明：
+
+```ts
+// graphBubbleInfo 的 promptText 每秒都变（停靠时长），但不影响地图绘制
+```
+
+这里做了组件级别的拦截：
+
+- `loading` 变了要重新渲染，因为 loading UI 变了。
+- `className` 变了要重新渲染。
+- `trajectoryRenderKey` 变了要重新渲染。
+- `center` 变化超过阈值才重新渲染。
+- `graphBubbleInfo.promptText` 变化不触发重渲染。
+
+这和 effect 内部的 key 判断是“双保险”：
+
+| 层级 | 作用 |
+|------|------|
+| 父页面 `isEqual(prev, newInfo)` | 如果接口返回轨迹没变，不更新 state |
+| `React.memo` | 如果 props 几何没变，不重新渲染组件 |
+| effect 内 `trajectoryRenderKey` | 如果组件进来了但几何没变，不清图重绘 |
+
+---
+
+## 11. 视野控制：setFitView 的时机
+
+`setFitView` 的作用是让所有覆盖物进入视野。它必须在覆盖物渲染后调用：
+
+```ts
+renderOverlays(trajectoryInfo);
+const overlays = $map?.getAllOverlays()?.filter(Boolean);
+if (overlays?.length > 0) {
+  if (!hasFitViewRef.current) {
+    $map.setFitView(overlays);
+    hasFitViewRef.current = true;
+  }
+}
+```
+
+为什么不每次都 setFitView：
+
+- 轮询刷新时，如果路线没变，只是文案变，不应该重置视野。
+- 用户可能正在手动缩放 / 拖动地图，每次轮询自动 fitView 会打断用户。
+- 移动端地图视野频繁跳动，会造成“页面不稳”的感受。
+
+所以策略是：首次进入地图时自动适配全量覆盖物，后续只在必要时由用户点击按钮或路线变化触发。
+
+地图上还有一个手动回到全局视野按钮：
+
+```ts
+onClick={() => {
+  if (Map.getInstance()) {
+    Map.getInstance().setFitView(
+      Map.getInstance()?.getAllOverlays()
+    );
+  }
+}}
+```
+
+这体现了一个交互取舍：默认不打扰用户，但提供手动恢复视野能力。
+
+---
+
+## 12. 中心点阈值：避免 GPS 微小漂移
+
+独立地图页会传 `center` 给 `DeliveryMap`：
+
+```tsx
+<DeliveryMap
+  trajectoryInfo={trackInfo}
+  graphBubbleInfo={graphBubbleInfo}
+  vehicleId={udid as string}
+  businessAreaId={businessAreaId}
+  center={mapCenter}
+/>
+```
+
+`DeliveryMap` 里：
+
+```ts
+useEffect(() => {
+  if (!mapInitialized || !center) return;
+  const map = (window as any)._amap_instance;
+  if (!map) return;
+
+  const prev = prevCenterRef.current;
+  const threshold = 0.0001;
+  if (
+    prev &&
+    Math.abs(center[0] - prev[0]) < threshold &&
+    Math.abs(center[1] - prev[1]) < threshold
+  ) {
+    return;
+  }
+  prevCenterRef.current = center;
+  map.setCenter(center, true);
+}, [mapInitialized, center]);
+```
+
+`0.0001` 经纬度大约是 10 米量级。车辆 GPS 会有小范围浮动，如果每次都居中，用户会看到地图轻微抖动。阈值判断可以过滤掉无意义的中心点更新。
+
+---
+
+## 13. 父页面层面的去重：isEqual
+
+`DetailMap` 组装完 `newInfo` 后：
+
+```ts
+setTrackInfo(prev => isEqual(prev, newInfo) ? prev : newInfo);
+```
+
+`setGraphBubbleInfo` 也用了类似写法：
+
+```ts
+setGraphBubbleInfo(prev =>
+  isEqual(prev, detailGraphBubbleDTO) ? prev : detailGraphBubbleDTO
+);
+```
+
+这属于父组件第一层优化：如果数据没变，直接返回旧引用，React 不会触发子组件更新。
+
+为什么还需要 `DeliveryMap` 自己的 render key：
+
+- 不是所有父页面都做了 `isEqual`，比如 `TaskProgress` 和 `MapView` 里还有直接 `setTrackInfo(newInfo)` 的场景。
+- 父页面的深比较可能包含文案字段，地图组件更清楚哪些字段影响几何。
+- 通用组件自身做防抖 / 防重绘，复用时更安全。
+
+---
+
+## 14. 和简历里 “30%-40% 无效重绘减少” 怎么讲
+
+这个数字不一定要说成精确压测结论，可以这样讲得稳：
+
+> 我们当时主要从轮询场景观察优化效果。车辆详情页会定时刷新，很多刷新只是 ETA、停靠时长、气泡文案变化，路线和坐标没有变化。优化前这些变化都会触发地图清图和重绘；优化后通过 render key 只比较几何字段，文案变化直接跳过。按轮询中无几何变化的请求占比估算，大概减少了 30%-40% 的无效清图和覆盖物重建。这个数字是基于业务刷新场景的估算，不是实验室 benchmark。
+
+如果面试官追问“你怎么验证”，可以说：
+
+- 开发时通过 console / React DevTools 观察 `renderOverlays` 调用次数。
+- 对比优化前后，ETA 文案变化不再触发 `clearMap`。
+- 手动拖动地图后等待轮询，视野不会再被频繁拉回。
+- 观察移动端 WebView，地图闪烁和跳动明显减少。
+
+这样诚实且可信。
+
+---
+
+## 15. 当前代码事实和注意点
+
+### 15.1 原文档里的“每次数据变化 clearMap + setFitView”已不是完整事实
+
+原文档说 `trajectoryInfo` 变化就：
+
+```txt
+clearMap -> renderOverlays -> setFitView
+```
+
+当前代码已经优化成：
+
+```txt
+mapReady + trajectoryInfo 非空
+-> 计算 trajectoryRenderKey
+-> key 没变且已 fitView：return
+-> key 变了：clearMap + renderOverlays
+-> 首次：setFitView
+```
+
+所以面试时应重点讲“不是所有数据变化都重绘，而是几何变化才重绘”。
+
+### 15.2 `hasFitViewRef` 当前只首次 fitView
+
+代码注释写“首次或路线真正变化”，但实现里 `hasFitViewRef.current` 设为 true 后，后续轨迹变化也不会自动 `setFitView`，除非组件重新挂载或用户手动点击按钮。
+
+如果被问优化点，可以说：
+
+> 现在策略偏向保护用户视野，不轻易自动调整。后续可以区分“路线整体变化”和“车辆点位变化”：如果路线点集变化很大，可以重置 `hasFitViewRef` 或增加 route key，触发一次 fitView；如果只是车辆移动，则不调整。
+
+### 15.3 WKT 正则当前不支持负坐标
+
+本地适配层 `POINT` 正则是：
+
+```ts
+/POINT\s*\(\s*([\d.]+)\s+([\d.]+)\s*\)/i
+```
+
+它没有匹配负号。国内经纬度一般是正数，所以业务上没暴露问题；但如果要通用化，应该改成支持 `[-\d.]+`。
+
+### 15.4 `MapView` 里 `SHUTDOWN` 被临时加入 hasTask
+
+独立地图页有注释：
+
+```ts
+VehicleStatus.SHUTDOWN,//后续 这里这一行 我们需要删掉的
+```
+
+说明这是开发阶段兼容逻辑，面试不要把它讲成最终完美设计。
+
+### 15.5 颜色状态还有扩展空间
+
+`RouteStatus.NotPassed_PICK = 2` 已有绿色路线配置，但部分页面组装 routes 时只传 `status: 0 / 1`，还没有完整按派送 / 揽收路线段区分绿色。可以作为后续优化：根据任务点类型给未行驶路线传 `0` 或 `2`。
+
+---
+
+## 16. 面试高频追问答案
+
+### Q1：为什么用 WKT，而不是直接传 lng/lat 数组？
+
+WKT 是地图组件内部统一协议。父页面的数据来源不同，有的来自发车 preview，有的来自运输详情，有的来自车辆定位，但都能转成 `POINT` 和 `LINESTRING`。地图组件只解析 WKT，不关心业务接口字段，这样复用性更好。
+
+### Q2：双轨迹怎么画？
+
+父页面把 `planPath` 转成 `LINESTRING`，标记 `status=0`；把 `historyPath` 转成 `LINESTRING`，标记 `status=1`。地图组件渲染时用 `route-line-${status}` 找样式，`status=0` 是蓝色未行驶路线，`status=1` 是灰色已行驶路线。
+
+### Q3：为什么要 clearMap 后再 renderOverlays？
+
+高德覆盖物不是 React 节点，没有自动 diff。如果不清理，旧路线和旧车辆 Marker 会留在地图上，轮询后可能出现多个车辆图标或路线叠加。所以轨迹真正变化时采用全量清理再重建，可靠性更高。
+
+### Q4：那为什么又说减少重绘？
+
+减少的是“无效重绘”。轨迹几何真的变了，仍然 `clearMap + renderOverlays`；但如果只是 ETA、停靠时长、气泡文案变化，就通过 `trajectoryRenderKey` 判断为无几何变化，直接跳过清图和覆盖物重建。
+
+### Q5：`trajectoryRenderKey` 里为什么不放 ETA？
+
+ETA 是站点旁边或业务卡片上的文案，不影响地图上 Marker 的位置、路线形状、车辆朝向。把 ETA 放进 key 会导致每次 ETA 变化都重绘地图，正是要避免的情况。
+
+### Q6：为什么 setFitView 只首次调用？
+
+`setFitView` 会改变地图中心点和缩放级别。轮询场景下如果频繁调用，会打断用户手动浏览地图。首次进入时自动适配全局视野，后续保持用户视角，需要时用户可以点按钮手动恢复全局视野。
+
+### Q7：React.memo 在这里有什么用？
+
+`DeliveryMap` 是重组件，内部有高德地图实例。`React.memo` 自定义比较可以在 React 层阻止无意义重新渲染，尤其忽略 `graphBubbleInfo.promptText` 这种每秒可能变化但不影响地图几何的字段。
+
+### Q8：`center` 为什么要阈值判断？
+
+GPS 坐标会小幅漂移。独立地图页如果每次都 `setCenter`，地图会轻微抖动。用 `0.0001` 经纬度阈值过滤大约 10 米内的小变化，只有车辆位置变化明显时才更新中心点。
+
+### Q9：React 组件怎么作为高德 Marker 内容？
+
+高德 Marker 的 `content` 要 HTML 字符串。我们用 React 写 `CarMarker`，再用 `transformJsxToHtml` 调 `ReactDOMServer.renderToStaticMarkup` 转成静态 HTML 字符串传给 Marker。这样保留 React 组件开发体验，又能接入非 React SDK。
+
+### Q10：这个项目里你最核心的地图优化是什么？
+
+我把地图渲染从“props 变化就重绘”改成“几何数据有效变化才重绘”。具体做法是统一轨迹模型、提取几何 render key、父子两层拦截相同数据、控制 fitView 时机，并对车辆中心点做阈值判断，解决轮询下的重复清图和视野抖动。
+
+---
+
+## 17. 可以直接放进简历的优化表述
+
+如果只写一条：
+
+> 负责无人车 H5 地图轨迹渲染优化，封装 `TrajectoryInfo` 统一承载车辆点位、站点编号、起终点及规划 / 历史路线，将接口 `lng/lat` 转为 WKT 并通过高德 AMap 覆盖物渲染；基于几何字段生成 `trajectoryRenderKey`，仅在路线 path、站点 / 车辆坐标、车辆朝向等有效变化时清图重绘，并限制 `setFitView` 自动调整时机，减少轮询刷新导致的无效重绘和视野抖动。
+
+如果拆成两条：
+
+> 封装通用地图轨迹组件 `DeliveryMap`，统一渲染车辆 Marker、站点编号 Marker、起终点 Marker 和规划 / 历史 Polyline，支持 `POINT / LINESTRING` WKT 转 AMap 覆盖物，完成车辆详情、发车规划、任务进行中等多场景复用。
+>
+> 针对轮询刷新导致的地图闪烁和视野抖动，设计 `trajectoryRenderKey` 仅比较影响几何绘制的字段，配合 `React.memo`、父层 `isEqual` 和中心点阈值判断，避免 ETA / 气泡文案变化触发清图重绘，减少约 30%-40% 无效覆盖物重建。
+
+---
+
+## 18. 复盘关键词
+
+- `DeliveryMap`
+- `TrajectoryInfo`
+- `StationPosition`
+- `CarPosition`
+- `RouteInfo`
+- `POINT(lng lat)`
+- `LINESTRING(lng lat,...)`
+- `wktToOverlay`
+- `AMap.Marker`
+- `AMap.Polyline`
+- `transformJsxToHtml`
+- `ReactDOMServer.renderToStaticMarkup`
+- `addOverlayConfig`
+- `RouteStatus.Passed = 1`
+- `RouteStatus.NotPassed_POST = 0`
+- `RouteStatus.NotPassed_PICK = 2`
+- `trajectoryRenderKey`
+- `prevTrajectoryRenderKeyRef`
+- `hasFitViewRef`
+- `React.memo custom compare`
+- `graphBubbleInfo.promptText`
+- `center threshold = 0.0001`
+- `setTrackInfo(prev => isEqual(prev, newInfo) ? prev : newInfo)`
+- `clearMap -> renderOverlays`
+- `setFitView`
+- 轮询刷新
+- 无效重绘
+- 视野抖动
+
