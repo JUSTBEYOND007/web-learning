@@ -1,0 +1,578 @@
+# 无人车 H5 面试速记版
+
+> 用法：
+>
+> 这份文档是面试前 30 分钟快速复习用的，不是完整资料库。完整细节看前面的深挖文档；这份只保留临场最容易用上的表达。
+
+---
+
+## 0. 项目总览 30 秒
+
+我实习参与的是一个无人配送车移动端 H5 项目，主要给站点和运营人员使用，包含车辆列表、车辆详情、发车任务创建、地图轨迹、历史任务、遥控和设置等页面。
+
+技术栈是 React 17、TypeScript、Modern.js、Jotai、AMap SDK。我的工作主要集中在无人车发车和详情链路：发车任务节点建模、地图轨迹渲染优化、路线卡片 Adapter 重构，以及车辆详情页状态感知轮询优化。
+
+这个项目让我接触到比较完整的 H5 工程实践，包括 Hash 路由、移动端 vw 适配、安全区、WebView 生命周期、Bridge、MTOP / REST 请求、状态管理、骨架屏、地图 SDK 和移动端性能优化。
+
+---
+
+## 1. 总表速记
+
+| 简历点 | 一句话 | 核心关键词 | 高频追问 | 边界提醒 |
+| --- | --- | --- | --- | --- |
+| 任务节点建模 | 用三段式数组统一管理派送、揽收、返程点 | `StopOverPointInfo`、`stopoverPointListArray`、ETA、拖拽、发车轮询 | 为什么三段数组？为什么不用一维数组？为什么发车后还要轮询？ | 发车接口返回 `requestId` 不等于成功，要查调度状态 |
+| 地图轨迹优化 | 用 `trajectoryRenderKey` 避免 ETA 文案变化导致地图重复清图重绘 | WKT、AMap、`POINT`、`LINESTRING`、`clearMap`、`setFitView` | 为什么能减少 30%-40%？为什么不把 ETA 放进 key？ | 路线 / 坐标真的变了仍然要重绘 |
+| 路线卡片重构 | 用 Adapter 把异构任务节点转成统一 `RouteItem`，复用 `TaskTimeline` | Adapter、`RouteItem`、`TaskTimeline`、点状态、线状态、箭头 | Adapter 带来什么收益？4 个适配层是什么？ | 历史链路还有旧 `TaskRoute`，不要说全量迁移完成 |
+| 状态感知轮询 | 根据 7 类车辆状态和页面可见性动态启停 5 秒轮询 | `VehicleStatus`、`isVisible`、`visibilitychange`、`pageshow/pagehide` | 为什么不用 WebSocket？为什么空闲也轮询？30%-40% 怎么算？ | 当前恢复可见是恢复轮询，不是立即请求 |
+| H5 工程化 | 真实移动端 H5，不是普通 PC Web | HashRouter、vw、安全区、WindVane、vConsole、Bridge | H5 和普通 Web 区别？怎么适配移动端？ | 不要说精通所有容器，讲“了解并参与适配” |
+
+---
+
+## 2. 技术栈速记
+
+### React 17
+
+**一句话：**
+
+项目用 React 17 函数组件和 Hooks 做页面状态编排，我主要用 `useState` 管页面数据，用 `useEffect` 管请求、轮询和事件监听，用 `useMemo/useCallback` 控制派生数据和 effect 依赖。
+
+**关键词：**
+
+- `useState`
+- `useEffect cleanup`
+- `useMemo`
+- `useCallback`
+- `React.memo`
+- 复杂状态驱动 UI
+
+**高频回答：**
+
+> 我主要不是写静态 UI，而是把车辆详情、地图轨迹、任务节点这些业务状态组织起来。比如车辆详情页先查车辆状态，再按状态查运输详情，最后驱动地图、任务卡片和操作按钮。
+
+---
+
+### TypeScript
+
+**一句话：**
+
+TS 主要用于约束业务 DTO、车辆状态枚举、站点节点模型和路线 UI 模型，避免派送点、揽收点、返程点字段混用。
+
+**关键词：**
+
+- `VehicleStatus`
+- `RecordStatus`
+- `StopOverPointInfo`
+- `RouteItem`
+- DTO 和 UI Model 分离
+
+**高频回答：**
+
+> 我感受到 TS 最大的价值是帮前端做数据建模。比如后端任务节点和前端路线卡片展示不是同一个模型，所以我会通过 Adapter 把 DTO 转成 `RouteItem`，组件只依赖稳定的 UI 模型。
+
+---
+
+### Modern.js
+
+**一句话：**
+
+Modern.js 在项目里负责 H5 工程化，包括本地开发、构建、Hash 路由、CDN 资源路径、px 转 vw、devServer proxy 和 externals。
+
+**关键词：**
+
+- `modern dev`
+- `modern build`
+- Hash 路由
+- `assetPrefix`
+- `pxToViewport`
+- `externals`
+- `devServer.proxy`
+
+**高频回答：**
+
+> H5 部署到 CDN 后，服务端不一定支持每个前端路由 fallback，所以项目用 HashRouter。构建时配置 CDN 前缀和版本目录，移动端样式用 px-to-vw 适配 375 设计稿。
+
+---
+
+### Jotai
+
+**一句话：**
+
+Jotai 用来管理无人车业务内的轻量跨页面状态，比如选中站点、发车成功标记、车辆列表 tab 记忆；全局用户和组织信息还是用 Rematch / Redux。
+
+**关键词：**
+
+- `selectedStationAtoms`
+- `vehicleCreateMapRecordSuccessAtoms`
+- `vehicleHomeTabAtoms`
+- 轻量跨页面状态
+
+**高频回答：**
+
+> 我理解状态管理要分层。用户、组织、业务区这种全局长期状态放 Redux；无人车业务内部临时共享状态，比如选中站点、发车成功标记，用 Jotai 更轻量。
+
+---
+
+### AMap SDK
+
+**一句话：**
+
+项目通过 `AMapLoader` 异步加载高德地图 SDK，地图 ready 后把 WKT 点线数据转成 Marker 和 Polyline，组件卸载时 destroy 地图实例。
+
+**关键词：**
+
+- `AMapLoader.load`
+- `Map.destroy`
+- `POINT(lng lat)`
+- `LINESTRING(...)`
+- Marker
+- Polyline
+
+**高频回答：**
+
+> 地图 SDK 是异步加载的，所以要等地图 ready 后再渲染覆盖物。轨迹数据用 WKT 表示，点转 Marker，线转 Polyline，页面卸载时销毁地图实例避免残留。
+
+---
+
+## 3. 简历点一：任务节点建模
+
+### 30 秒话术
+
+发车任务页的难点是配置流程复杂，用户要选择派送 / 途经点、揽收点和返程点，还要支持拖拽排序、先派 / 先揽切换、算路预览、ETA 回填和最终发车。
+
+我把不同站点抽象成统一的 `StopOverPointInfo`，再用三段式数组 `[派送点[], 揽收点[], 返程点[]]` 管理。这样列表展示、拖拽排序、算路参数、ETA 回填和发车参数都从同一份数据派生，减少状态分散和表单维护成本。
+
+### 3 个代码关键词
+
+```ts
+StopOverPointInfo
+stopoverPointListArray = [postPoints, pickPoints, returnPoints]
+pollDispatchStatus(requestId)
+```
+
+### 伪代码
+
+```ts
+type StopoverPointListArray = [
+  StopOverPointInfo[],
+  StopOverPointInfo[],
+  StopOverPointInfo[],
+];
+
+const [stopoverPointListArray, setStopoverPointListArray] =
+  useState<StopoverPointListArray>([[], [], defaultReturnPoint]);
+
+function getOrderedTaskPoints() {
+  return isDeliveryFirst
+    ? [...postPoints, ...pickPoints]
+    : [...pickPoints, ...postPoints];
+}
+
+function buildDispatchParams() {
+  return {
+    transportParam: {
+      targetAutoports: getOrderedTaskPoints().map(point => ({
+        utpAutoportId: point.utpAutoportId,
+        targetIntent: point.type === 'PICK_POINT' ? 'WaybillPick' : 'WaybillPost',
+      })),
+    },
+    returnToHubParam: {
+      parking: buildReturnParking(stopoverPointListArray[2][0]),
+    },
+  };
+}
+```
+
+### 3 个追问答案
+
+**Q：为什么不用一维数组？**
+
+> 因为派送、揽收、返程的业务含义不同。派送和揽收可以切换先后顺序，返程点要进入单独的 `returnToHubParam`。三段式数组把业务分组直接体现在数据结构里，比一维数组后续再过滤类型更清晰。
+
+**Q：拖拽排序怎么处理？**
+
+> 拖拽只作用于某一段，比如派送段或揽收段。拖拽结束后用 `oldIndex/newIndex` 更新对应段数组，再重新请求算路预览和 ETA。
+
+```ts
+function onSortEnd(sectionIndex, oldIndex, newIndex) {
+  const next = [...stopoverPointListArray];
+  next[sectionIndex] = arrayMove(next[sectionIndex], oldIndex, newIndex);
+  setStopoverPointListArray(next);
+  requestPreviewRoute(next);
+}
+```
+
+**Q：为什么发车后还要轮询？**
+
+> 发车接口返回 `requestId` 只代表调度请求被创建，不代表车辆真正发车成功。真实结果要查调度状态，所以用 `while + await` 串行轮询，直到成功、失败或超时。
+
+```ts
+async function pollDispatchStatus(requestId) {
+  for (let i = 0; i < 15; i++) {
+    const res = await queryDispatchStatus(requestId);
+    if (res.status === 2) return res;
+    if (res.status === 3) throw new Error('发车失败');
+    await sleep(500);
+  }
+  throw new Error('发车超时');
+}
+```
+
+### 1 个边界提醒
+
+不要说“发车接口成功就发车成功”。要说：
+
+> 发车成功依赖调度状态，接口返回 `requestId` 后还要轮询确认。
+
+---
+
+## 4. 简历点二：地图轨迹优化
+
+### 30 秒话术
+
+车辆详情页会轮询刷新，原来只要接口数据变化就可能触发地图 `clearMap`、重画覆盖物和 `setFitView`。但很多刷新只是 ETA、气泡文案或停靠时长变化，并不影响地图几何，导致地图闪烁和视野抖动。
+
+我封装了轨迹数据结构，用 WKT 表达车辆点、站点点和路线线，并设计 `trajectoryRenderKey`，只比较路线 path、站点坐标、车辆坐标、车辆朝向这些几何字段。文案变化不触发清图重绘，从而减少约 30% - 40% 的无效覆盖物重建。
+
+### 3 个代码关键词
+
+```ts
+trajectoryRenderKey
+wktToOverlay
+setFitView only when geometry changed
+```
+
+### 伪代码
+
+```ts
+function getTrajectoryRenderKey(trajectoryInfo) {
+  return JSON.stringify(
+    trajectoryInfo.map(item => ({
+      car: item.carPoint
+        ? { wkt: item.carPoint.wkt, angle: item.carPoint.angle }
+        : null,
+      points: item.staPoints?.map(point => ({
+        id: point.staId,
+        wkt: point.wkt,
+        status: point.status,
+      })),
+      routes: item.routes?.map(route => ({
+        path: route.path,
+        status: route.status,
+      })),
+      endPoint: item.endPoint?.wkt,
+    }))
+  );
+}
+
+useEffect(() => {
+  const key = getTrajectoryRenderKey(trajectoryInfo);
+  const changed = key !== prevKeyRef.current;
+  prevKeyRef.current = key;
+
+  if (!changed && hasFitViewRef.current) return;
+
+  map.clearMap();
+  renderOverlays(trajectoryInfo);
+
+  if (!hasFitViewRef.current) {
+    map.setFitView(map.getAllOverlays());
+    hasFitViewRef.current = true;
+  }
+}, [trajectoryInfo, mapReady]);
+```
+
+### 3 个追问答案
+
+**Q：为什么不把 ETA 放进 `trajectoryRenderKey`？**
+
+> ETA 是文案，不影响点、线、车辆位置。如果放进 key，每次 ETA 变化都会清图重绘，正好违背优化目标。
+
+**Q：地图优化会不会导致车辆位置不更新？**
+
+> 不会。车辆坐标、车辆朝向、路线 path、站点 wkt 都在 key 里，这些几何数据变化会正常重绘。跳过的只是非几何变化。
+
+**Q：30% - 40% 怎么算？**
+
+> 这是无效重绘减少，不是所有渲染减少。假设 10 次轮询里有 3 到 4 次只是 ETA 或文案变化，优化前会重绘 10 次，优化后只重绘 6 到 7 次，所以减少约 30% - 40%。
+
+### 1 个边界提醒
+
+不要说“地图刷新减少 40%”。要说：
+
+> 减少的是轮询场景下的无效覆盖物重建和视野调整；真实轨迹变化仍然更新。
+
+---
+
+## 5. 简历点三：路线卡片重构
+
+### 30 秒话术
+
+项目里多个业务链路都要展示路线卡片，比如车辆详情当前任务、历史任务、发车确认和任务进行中页。但这些链路的后端数据结构不一致，导致路线卡片里重复写状态适配、ETA 展示和起终点样式。
+
+我引入 Adapter 思路，把不同来源的任务节点统一转换成前端标准路线模型 `RouteItem`，再交给 `TaskTimeline` 渲染。这样点状态、线状态、箭头位置、ETA 和右侧扩展都集中维护，后续新增状态或调整样式不用每条业务链路重复改。
+
+### 3 个代码关键词
+
+```ts
+RouteItem
+TaskTimeline
+buildDetailTaskRouteItems / buildHistoryFulfillmentTaskNodes
+```
+
+### 伪代码
+
+```ts
+interface RouteItem {
+  id: string | number;
+  title: string;
+  eta?: string;
+  markerType?: 'start' | 'end' | 'index' | 'dot';
+  pointStatus?: 'done' | 'active' | 'pending' | 'cancel';
+  lineStatus?: 'done' | 'active' | 'pending' | 'cancel';
+  arrowPosition?: 'none' | 'line' | 'point';
+  raw?: unknown;
+}
+
+function adaptTaskNodes(nodes): RouteItem[] {
+  const progress = resolveRouteProgress(nodes);
+
+  return nodes.map((node, index) => ({
+    id: node.id ?? index,
+    title: node.title,
+    eta: node.eta,
+    markerType: getMarkerType(index, nodes.length),
+    pointStatus: getPointStatus(index, progress),
+    lineStatus: getLineStatus(index, progress),
+    arrowPosition: getArrowPosition(index, progress),
+    raw: node,
+  }));
+}
+
+function CurrentTaskCard({ taskNodes }) {
+  const routeItems = adaptTaskNodes(taskNodes);
+  return <TaskTimeline routeItems={routeItems} />;
+}
+```
+
+### 3 个追问答案
+
+**Q：Adapter 带来什么收益？**
+
+> 隔离后端 DTO 和 UI 组件。UI 只认 `RouteItem`，不同业务数据由 adapter 负责转换。状态逻辑集中后，新增取消态、进行态、箭头位置或样式调整，不用每个卡片重复改。
+
+**Q：4 个适配层是什么？**
+
+> 可以按业务来源讲：通用任务节点到 `RouteItem`、历史记录到任务节点、车辆详情当前任务到 `RouteItem`、发车确认 / 任务中卡片到 step 模型。严格说第四个输出不是 `RouteItem`，但本质也是 DTO 到 UI 模型的 Adapter。
+
+**Q：点状态和线状态为什么分开？**
+
+> 点表示站点本身是否完成，线表示从当前点到下一个点的路段状态。比如当前点已到达，但下一段可能正在行驶，所以拆成 `pointStatus` 和 `lineStatus` 更灵活。
+
+### 1 个边界提醒
+
+不要说“所有路线卡片都全量迁移完成”。要说：
+
+> 核心链路已完成标准模型和 Adapter 抽象，历史任务里仍有旧 `TaskRoute` 残留，后续可以继续迁移。
+
+---
+
+## 6. 简历点四：状态感知轮询
+
+### 30 秒话术
+
+车辆详情页要实时展示车辆状态、位置、轨迹、任务节点和操作按钮，原来固定 5 秒轮询会在切后台、锁屏、横屏、遥控或车辆低变化状态下继续请求，很多请求用户看不到。
+
+我把轮询条件拆成两层：业务状态上只对 `DELIVERYING / PICKING / LOADING / RETURN / MOVING / CORRECT / VACANT` 这 7 类状态轮询；页面活跃性上通过 `visibilitychange`、`pageshow/pagehide`、横竖屏和遥控事件维护 `isVisible`。只有页面可见且车辆处于关注状态时才启动轮询，减少约 30% - 40% 无效请求。
+
+### 3 个代码关键词
+
+```ts
+DETAIL_POLLING_STATUSES
+isVisible
+visibilitychange + pageshow/pagehide
+```
+
+### 伪代码
+
+```ts
+const DETAIL_POLLING_STATUSES = new Set([
+  'DELIVERYING',
+  'PICKING',
+  'LOADING',
+  'RETURN',
+  'MOVING',
+  'CORRECT',
+  'VACANT',
+]);
+
+function canPolling(status, isVisible) {
+  return isVisible && DETAIL_POLLING_STATUSES.has(status);
+}
+
+useEffect(() => {
+  if (!canPolling(vehicleInfo?.vehicleAppStatus, isVisible)) return;
+
+  const timer = setInterval(() => {
+    retrieveRecordDetail();
+  }, 5000);
+
+  return () => clearInterval(timer);
+}, [vehicleInfo?.vehicleAppStatus, isVisible, retrieveRecordDetail]);
+```
+
+页面可见性：
+
+```ts
+useEffect(() => {
+  const onVisibilityChange = () => setIsVisible(!document.hidden);
+  const onPageShow = () => setIsVisible(true);
+  const onPageHide = () => setIsVisible(false);
+  const onControlStart = () => setIsVisible(false);
+  const onControlEnd = () => setIsVisible(true);
+
+  document.addEventListener('visibilitychange', onVisibilityChange);
+  window.addEventListener('pageshow', onPageShow);
+  window.addEventListener('pagehide', onPageHide);
+  document.addEventListener('vehicle-control-start', onControlStart);
+  document.addEventListener('vehicle-control-end', onControlEnd);
+
+  return () => {
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    window.removeEventListener('pageshow', onPageShow);
+    window.removeEventListener('pagehide', onPageHide);
+    document.removeEventListener('vehicle-control-start', onControlStart);
+    document.removeEventListener('vehicle-control-end', onControlEnd);
+  };
+}, []);
+```
+
+### 3 个追问答案
+
+**Q：为什么不用 WebSocket？**
+
+> 详情页需要秒级同步，不是毫秒级控制。WebSocket 要服务端推送、重连、鉴权和 WebView 后台保活，成本更高。当前已有 HTTP 接口，状态感知轮询改动小、稳定性高，能满足详情页需求。遥控这种强实时链路会走独立原生通道。
+
+**Q：为什么空闲 `VACANT` 也轮询？**
+
+> 空闲车仍然可能被发车、移车、开关机，状态也可能被其他端改变。详情页按钮状态要保持准确，所以空闲态保留轮询；关机、充电、不可用这类低变化状态则不做高频轮询。
+
+**Q：30% - 40% 怎么算？**
+
+> 假设详情页停留 10 分钟，固定 5 秒轮询是 120 次请求。优化后如果只有 6 到 7 分钟处于页面可见且活跃状态，请求约 72 到 84 次，减少比例就是 30% 到 40%。这个数字指详情页无效轮询请求，不是全站 QPS。
+
+### 1 个边界提醒
+
+不要说“恢复可见后立即刷新”。要说：
+
+> 当前实现是恢复可见后重新建立轮询，后续可以在 `isVisible` 从 false 变 true 时主动请求一次，进一步提升及时性。
+
+---
+
+## 7. H5 工程化速记
+
+### 30 秒话术
+
+这个项目让我第一次比较完整地接触移动端 H5 工程。它不是普通 PC Web，而是运行在浏览器和 App WebView 容器中，所以要考虑 Hash 路由、移动端 vw 适配、iOS 安全区、body 滚动控制、WindVane / 小程序 / Flutter Bridge、MTOP 和 REST 请求、vConsole 调试、首屏骨架屏和页面可见性。
+
+### 3 个代码关键词
+
+```ts
+HashRouter
+pxToViewport({ viewportWidth: 375 })
+pushWindow(url, history)
+```
+
+### 高频追问答案
+
+**Q：H5 和普通 Web 有什么区别？**
+
+> H5 更关注移动端容器和系统行为。比如 WebView 导航、原生 Bridge、页面切后台、锁屏、横竖屏、iOS 安全区、触摸事件和移动端调试，这些在普通 PC Web 里没那么突出。
+
+**Q：为什么用 HashRouter？**
+
+> H5 静态资源部署在 CDN 上，服务端不一定支持前端路由 fallback。Hash 路由保证所有路径都回到同一个 HTML，再由前端解析 `#` 后面的业务路由，也适合 WebView 打开指定页面。
+
+**Q：移动端怎么适配？**
+
+> HTML 设置 viewport 和 `viewport-fit=cover`，样式里处理 `env(safe-area-inset-bottom)`，构建时用 `postcss-px-to-viewport` 把 px 转 vw，同时把第三方组件库选择器加入黑名单，避免组件样式被破坏。
+
+### 1 个边界提醒
+
+不要说“精通 H5 容器”。可以说：
+
+> 通过这个项目了解并参与了 WindVane / 小程序 / Flutter WebView 的适配和 Bridge 封装，能讲清楚基本原理和注意点。
+
+---
+
+## 8. 最容易被追问的 12 个问题
+
+### 1. 你这个项目最大的难点是什么？
+
+> 最大难点是状态链路复杂。比如发车任务不是普通表单，而是站点选择、拖拽排序、先派先揽、返程点、算路、ETA、发车参数和调度轮询串起来。我通过统一节点模型让这些状态从同一份数据派生，减少不一致。
+
+### 2. 你怎么证明不是只写 UI？
+
+> 我做的几个点都不是单纯 UI：任务节点建模解决复杂表单状态；地图 `trajectoryRenderKey` 解决轮询导致的无效重绘；路线卡片 Adapter 解决多链路重复适配；状态感知轮询解决后台无效请求。
+
+### 3. 三段式数组有什么缺点？
+
+> 它对当前派送 / 揽收 / 返程三类节点很清晰，但如果未来任务类型继续增加，数组下标语义会变弱。后续可以升级成带 key 的对象，例如 `{ delivery: [], pickup: [], return: [] }`，可读性更强。
+
+### 4. 为什么不用 `useReducer` 管发车页？
+
+> 可以用。当前核心是先把数据模型抽清楚。后续如果动作继续增加，比如添加站点、拖拽、切换顺序、回填 ETA，可以用 `useReducer` 收敛 action，让状态变化更可追踪。
+
+### 5. 地图为什么不用 React 直接渲染？
+
+> AMap 覆盖物不是普通 DOM，而是地图 SDK 管理的 Marker、Polyline。React 负责数据状态，地图 SDK 负责真实覆盖物渲染，所以需要在 effect 里把数据转换成地图实例。
+
+### 6. Adapter 和普通函数有什么区别？
+
+> Adapter 本质可以是普通函数，但它承担的是明确的边界职责：把外部异构数据转换成内部稳定模型。重点不是形式，而是隔离后端 DTO 和 UI 组件。
+
+### 7. 状态感知轮询为什么不用 ahooks `useRequest`？
+
+> 列表页稳定 10 秒轮询适合 `useRequest pollingInterval`；详情页轮询条件更复杂，依赖车辆状态、页面可见性、横屏和遥控事件，所以手写 `useEffect + setInterval cleanup` 更直观。后续可以封装成自定义 hook。
+
+### 8. `setInterval` 有什么风险？
+
+> 弱网下上一轮请求没结束，下一轮可能又触发，造成堆积。后续可以加请求锁或用递归 `setTimeout`，保证上一轮结束后再安排下一轮。
+
+### 9. 30%-40% 收益可靠吗？
+
+> 这是基于无效窗口的估算口径。地图优化减少的是无效重绘，轮询优化减少的是详情页无效请求，不夸大为全站性能提升。
+
+### 10. 为什么要处理 `pageshow/pagehide`？
+
+> 移动端 H5 可能进入 BFCache，尤其 iOS 返回页面时不一定完整重新挂载。`pageshow/pagehide` 可以补充 `visibilitychange`，保证恢复和暂停更可靠。
+
+### 11. 你做过哪些移动端适配？
+
+> 参与和理解了 viewport、vw 适配、iOS 安全区、body 滚动控制、触摸滑动、底部固定栏、vConsole 调试和 WebView Bridge。
+
+### 12. 如果继续优化，你会做什么？
+
+> 抽通用轮询 hook、用请求锁替代裸 `setInterval`、继续迁移历史路线卡片到 `TaskTimeline`、给 Bridge 补类型、给缓存加过期策略。
+
+---
+
+## 9. 诚实边界必背
+
+1. 地图 `30% - 40%` 是减少无效重绘，不是所有地图渲染都减少。
+2. 状态感知轮询 `30% - 40%` 是减少详情页无效请求，不是全站 QPS。
+3. 历史任务链路还有旧 `TaskRoute`，不要说路线卡片全量迁移完成。
+4. `TaskProgress` 仍有固定 5 秒轮询，后续可复用状态感知 hook。
+5. 当前恢复可见是恢复轮询，不是立即请求。
+6. Bridge 部分类型仍有 `any`，后续可以增强类型。
+7. `setInterval` 弱网下可能堆积，后续可用请求锁或递归 `setTimeout`。
+
+---
+
+## 10. 面试前 5 分钟背这个
+
+> 我实习参与的是菜鸟无人车移动端 H5 项目，技术栈是 React 17、TypeScript、Modern.js、Jotai 和 AMap SDK。项目面向站点和运营人员，包含车辆列表、详情、发车任务创建、地图轨迹、历史任务和遥控等页面。
+>
+> 我的工作主要有四块。第一是发车任务节点建模，把派送、揽收、返程点抽成统一 `StopOverPointInfo`，用三段式数组管理，支持拖拽排序、先派先揽、返程点配置和 ETA 回填。第二是地图轨迹优化，用 WKT 表达车辆点、站点点和路线线，并通过 `trajectoryRenderKey` 只在几何数据变化时重绘地图，减少轮询导致的无效清图和视野抖动。第三是路线卡片重构，用 Adapter 把不同业务链路的任务节点转成统一 `RouteItem`，再交给 `TaskTimeline` 渲染。第四是状态感知轮询，根据 7 类车辆状态和页面可见性动态启停 5 秒轮询，结合 `visibilitychange`、`pageshow/pagehide`、横屏和遥控事件减少后台无效请求。
+>
+> 这个项目让我学到完整的 H5 工程经验：Hash 路由、vw 移动端适配、安全区、WebView 生命周期、Bridge、MTOP / REST 请求、Jotai 状态、地图 SDK、骨架屏、移动端调试和性能优化。后续如果继续优化，我会抽通用轮询 hook、补请求锁、继续迁移历史路线卡片，并增强 Bridge 类型。
+
