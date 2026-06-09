@@ -1,0 +1,981 @@
+# 简历第四点补充深挖：路线卡片重构 / Adapter 模式
+
+> 目标：这份文档用于离职后复盘和面试。重点解释“路线卡片重构”为什么值得写进简历：它不是简单改样式，而是把多业务链路里的异构任务节点统一成标准路线模型，再用 Adapter 层隔离后端 DTO 和 UI 渲染逻辑。
+>
+> 对应简历点：路线卡片重构：针对多业务链路中任务节点结构不一致、路线卡片重复适配的问题，引入 Adapter 模式重构任务路线卡片，新增 4 个数据适配层，将异构任务节点统一转换为标准路线模型，复用同一套路由卡片渲染逻辑，降低后续状态扩展和样式调整成本。
+
+---
+
+## 0. 一句话项目定位
+
+这是无人车 H5 里的任务路线 / 当前任务 / 历史任务时间线重构。不同页面拿到的任务节点结构不同：发车确认页有 `stopoverPointListArray`，任务进行中页有 `transportAutoports` 和 `fulfillmentTaskNodeDTOS`，车辆详情页有实时任务节点，历史记录页有历史运输记录。但 UI 都是在画同一种“路线卡片”：起点、途经站点、终点、ETA、已完成 / 进行中 / 待到达状态、蓝色箭头、连线和展开。重构目标就是把这些异构 DTO 先适配成统一模型，再交给同一套渲染组件。
+
+核心文件：
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| 标准路线模型 | `src/pages/UnmannedVehicleNew/components/TaskTimeline/types.ts` | 定义 `RouteItem`、点/线/箭头三维状态 |
+| 通用任务节点 adapter | `src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts` | `FulfillmentTaskNodeDTO[] -> RouteItem[]` |
+| 通用时间线组件 | `src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx` | 双输入模式：`routeItems` 优先，否则内部适配 `taskNodes` |
+| 历史记录 adapter | `src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts` | 历史接口记录 -> `FulfillmentTaskNodeDTO[]` |
+| 车辆详情当前任务 adapter | `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/components/currentTaskCard.adapter.ts` | 实时任务节点 -> `RouteItem[]`，用于 `CurrentTaskCard` |
+| 发车确认 / 任务中 adapter | `src/pages/UnmannedVehicleNew/components/VehicleDetail/vehicleInfoCard.adapter.ts` | `stopoverPointListArray / fulfillmentTaskNodeDTOS / transportInfo -> PendingTaskStepItem[]` |
+| 当前任务卡片 | `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/components/CurrentTaskCard.tsx` | 使用 `TaskTimeline routeItems` 渲染当前任务 |
+| 详情页任务区 | `src/pages/UnmannedVehicleNew/Vehicle/DetailMap/components/DetailTaskSection.tsx` | 组合标题、历史任务入口、当前任务卡片 |
+| 旧路线组件 | `src/pages/UnmannedVehicleNew/components/taskRoute/index.tsx` | 迁移前/部分历史卡片仍使用的内联状态实现 |
+| 历史列表 | `src/pages/UnmannedVehicleNew/HistoryByCar/record-list.tsx` | 给历史记录补标准任务节点 |
+
+---
+
+## 1. 面试版讲法
+
+### 1.1 30 秒版本
+
+我负责过无人车 H5 的路线卡片重构。原来的问题是车辆详情、任务进行中、历史任务、发车确认这些页面都要展示任务路线，但接口结构和节点状态不一致，导致每个页面都写一套步骤条逻辑，后续改样式或加状态要改多处。我引入 Adapter 模式，把异构数据先转换成统一的路线 UI 模型，比如 `RouteItem` 或 `PendingTaskStepItem`，再交给统一组件渲染。核心是把圆点状态、连线状态、箭头位置拆成独立字段，解决“点已到达但下一段仍行驶中”这种组合状态，降低后续扩展和维护成本。
+
+### 1.2 3 分钟版本
+
+业务上，无人车路线卡片出现在多个链路：发车前确认页展示规划路线，发车后任务进行中展示实时 ETA，车辆详情页展示当前任务，历史记录页展示已完成 / 已取消任务。它们视觉上都是一条路线时间线，但数据来源完全不同。比如历史记录接口是 `transportAutoportRecords`，任务进行中接口是 `transportAutoports`，详情页拿到的是 `fulfillmentTaskNodeDTOS`，发车确认页是前端本地维护的 `stopoverPointListArray`。
+
+如果组件直接读这些 DTO，就会出现大量 if/else：这个页面读 `statusDesc`，那个页面读 `recordStatus`，另一个页面从 `eta` 文案里判断状态。重构时我把“数据适配”和“UI 渲染”拆开：adapter 负责把不同 DTO 转成标准模型，组件只消费标准模型。
+
+标准模型里最关键的是把路线状态拆成三个维度：`pointStatus` 控制圆点颜色，`lineStatus` 控制连线颜色，`arrowPosition` 控制当前箭头在圆点上还是线段上。这样就不需要枚举所有组合状态，比如“当前正在前往下一个站点”可以表达为上一段 `lineStatus=active`、箭头在 `line`，但下一站圆点还是 `pending`。
+
+项目里有几类 adapter：`TaskTimeline/adapters.ts` 把实时履约节点转 `RouteItem[]`；`historyRecord.adapter.ts` 把历史接口转成标准 `FulfillmentTaskNodeDTO[]`；`currentTaskCard.adapter.ts` 专门处理车辆详情当前任务的进度和取消状态；`vehicleInfoCard.adapter.ts` 处理发车确认页和任务进行中页之间静态路线 / 动态路线的切换。这样后续如果改路线卡片样式，主要改 `TaskTimeline` 或卡片渲染层；如果后端字段变了，只改对应 adapter。
+
+---
+
+## 2. 为什么要重构：重复适配的成本
+
+重构前 / 迁移中能看到几种重复逻辑：
+
+| 场景 | 数据来源 | 旧问题 |
+|------|----------|--------|
+| 发车确认页 | `stopoverPointListArray` | 本地站点数组和后端节点结构不同，需要单独拼起点/终点/编号 |
+| 任务进行中页 | `/transport/detail` 的 `transportAutoports` | 要把状态、ETA、实际到达时间转换成路线节点 |
+| 车辆详情当前任务 | `fulfillmentTaskNodeDTOS` | 需要判断当前箭头位置、已完成节点、取消节点 |
+| 历史记录列表 | `transportAutoportRecords` | 历史接口字段名不同，状态描述是中文 `statusDesc` |
+| 旧历史卡片 | `taskRoute` 组件 | 状态判断、展开、图片标识都写在组件内部 |
+
+`taskRoute/index.tsx` 是典型旧实现：
+
+```ts
+const doneIndex = reverseList.findIndex(
+  (item) => item.stopoverPointDetailInfoDTO.recordStatus === RecordStatus.DONE
+);
+const isCancelIndex = fulfillmentTaskNodeDTOS?.findIndex(
+  (item) => item.stopoverPointDetailInfoDTO.recordStatus === RecordStatus.CANCEL
+);
+const isProgressIndex = fulfillmentTaskNodeDTOS?.findIndex(
+  (item) => item.stopoverPointDetailInfoDTO.recordStatus === RecordStatus.InProgress
+);
+const isCreatingIndex = fulfillmentTaskNodeDTOS?.findIndex(
+  (item) => item.stopoverPointDetailInfoDTO.recordStatus === RecordStatus.CREATING
+);
+```
+
+然后模板里继续写：
+
+```tsx
+<div className={`dot ${getCurrentIndex().index >= index + 1 ? 'active' : ''} ${getClassName(o.stopoverPointDetailInfoDTO.recordStatus)} `} />
+<div className={`line ${getCurrentIndex().index >= index + 1 ? 'active' : ''} ...`} />
+{getCurrentIndex().index === index + 1 && <img className="arrow-indicator" ... />}
+```
+
+问题是：状态推导、样式类名、箭头位置、展开逻辑混在同一个组件里。另一个页面要同样效果，就得复制一遍。
+
+---
+
+## 3. 标准路线模型：RouteItem
+
+`TaskTimeline/types.ts`：
+
+```ts
+export type RouteMarkerType = 'dot' | 'start' | 'end' | 'index';
+export type RouteVisualStatus = 'done' | 'active' | 'pending' | 'cancel';
+export type RouteArrowPosition = 'none' | 'line' | 'point';
+
+export interface RouteItem {
+  id: string;
+  title: string;
+  eta?: string;
+  markerType?: RouteMarkerType;
+  markerLabel?: string;
+  pointStatus?: RouteVisualStatus;
+  lineStatus?: RouteVisualStatus;
+  arrowPosition?: RouteArrowPosition;
+  isCurrentStation?: boolean;
+  imageCount?: number;
+  rawNode?: FulfillmentTaskNodeDTO;
+}
+```
+
+这套模型的价值在于：它不是后端 DTO，而是 UI 渲染模型。
+
+### 3.1 三维状态设计
+
+| 字段 | 控制什么 | 示例 |
+|------|----------|------|
+| `pointStatus` | 圆点 / 编号颜色 | `done` 灰色，`pending` 蓝色，`cancel` 取消 |
+| `lineStatus` | 当前节点下面的连线颜色 | `done` 已走过，`active` 正在走，`pending` 未走 |
+| `arrowPosition` | 蓝色箭头位置 | `point` 在圆点上，`line` 在线段中，`none` 不显示 |
+
+为什么不用一个 `status` 枚举：
+
+```txt
+一个枚举很难表达组合状态：
+  点已完成 + 下一段正在行驶
+  点未到达 + 上一段正在行驶
+  箭头在点上
+  箭头在线上
+```
+
+拆成三维后，组合表达很自然：
+
+```ts
+{
+  pointStatus: 'done',
+  lineStatus: 'active',
+  arrowPosition: 'line'
+}
+```
+
+这就是简历里“降低后续状态扩展成本”的核心。
+
+### 3.2 `rawNode` 的作用
+
+`rawNode?: FulfillmentTaskNodeDTO` 是保留原始节点的逃生口。
+
+原因：
+
+- `RouteItem` 覆盖主要渲染字段。
+- 但个别页面可能还要读原始 DTO，比如图片数量、站点手机号、日志字段。
+- 如果把所有字段都平铺进 `RouteItem`，标准模型会越来越胖。
+
+所以 `rawNode` 是一种工程权衡：主流程解耦，特殊字段可按需读取。
+
+---
+
+## 4. Adapter 1：通用任务节点 -> RouteItem
+
+文件：`TaskTimeline/adapters.ts`
+
+### 4.1 当前活跃节点判断
+
+当前代码不是只靠 ETA 文案，而是优先看 `recordStatus`：
+
+```ts
+export const getTaskTimelineActiveIndex = (
+  taskNodes: FulfillmentTaskNodeDTO[]
+) => {
+  const progressIndex = taskNodes.findIndex(
+    (item) =>
+      normalizeRecordStatus(item.stopoverPointDetailInfoDTO?.recordStatus) ===
+      RecordStatus.InProgress
+  );
+  if (progressIndex > -1) return progressIndex;
+
+  const lastDoneIndex = findLastDoneIndex(taskNodes);
+  if (lastDoneIndex > -1) return lastDoneIndex;
+
+  const estimateIndex = taskNodes.findIndex((item) =>
+    item.stopoverPointDetailInfoDTO?.eta?.includes('预计')
+  );
+  if (estimateIndex > -1) return estimateIndex;
+
+  const arrivedIndex = findLastIndexByEta(taskNodes, '已到达');
+  if (arrivedIndex > -1) return arrivedIndex;
+
+  return taskNodes.length - 1;
+};
+```
+
+优先级：
+
+1. `recordStatus === InProgress`：最可靠，表示正在进行的节点。
+2. 最后一个 `DONE`：任务已完成到哪个节点。
+3. ETA 包含“预计”：表示正在前往目标站。
+4. 最后一个 ETA 包含“已到达”：表示已到达某站。
+5. 默认最后一个节点。
+
+这比原文档里“只通过 ETA 文案判断”更准确。
+
+### 4.2 状态归一化
+
+```ts
+const normalizeRecordStatus = (status?: RecordStatus | string) => {
+  if (status === undefined || status === null || status === '') return undefined;
+  const numericStatus = Number(status);
+  return Number.isNaN(numericStatus) ? status : numericStatus;
+};
+```
+
+为什么要做：接口可能返回数字枚举，也可能返回字符串。统一转一次，后面比较 `RecordStatus.InProgress / DONE / CANCEL` 更稳。
+
+### 4.3 构建 RouteItem
+
+```ts
+export const buildRouteItemsFromTaskNodes = (
+  taskNodes: FulfillmentTaskNodeDTO[],
+  options?: { showIndex?: boolean }
+): RouteItem[] => {
+  if (!taskNodes?.length) return [];
+
+  const { showIndex = false } = options || {};
+  const activeIndex = getTaskTimelineActiveIndex(taskNodes);
+  const progressIndex = taskNodes.findIndex(
+    (item) =>
+      normalizeRecordStatus(item.stopoverPointDetailInfoDTO?.recordStatus) ===
+      RecordStatus.InProgress
+  );
+  const activeLineIndex = progressIndex > 0 ? progressIndex - 1 : -1;
+  let postCounter = 0;
+
+  return taskNodes.map((item, index) => {
+    const point = item.stopoverPointDetailInfoDTO;
+    const type = point?.type;
+    const isDonePoint =
+      (index <= activeIndex && activeLineIndex === -1) || index < activeIndex;
+
+    if (
+      showIndex &&
+      type !== StopOverPointType.START_POINT &&
+      type !== StopOverPointType.END_POINT
+    ) {
+      postCounter++;
+    }
+
+    const markerType = showIndex
+      ? type === StopOverPointType.START_POINT
+        ? 'start'
+        : type === StopOverPointType.END_POINT
+          ? 'end'
+          : 'index'
+      : 'dot';
+
+    return {
+      id: String(point?.staId || point?.title || index),
+      title: point?.title || point?.staName || '--',
+      eta: point?.eta,
+      markerType,
+      markerLabel: showIndex ? getTaskTimelineIndexLabel(item, postCounter) : '',
+      pointStatus: isDonePoint ? 'done' : 'pending',
+      lineStatus:
+        index === activeLineIndex
+          ? 'active'
+          : index < activeIndex
+            ? 'done'
+            : 'pending',
+      arrowPosition:
+        index === activeLineIndex
+          ? 'line'
+          : index === activeIndex
+            ? 'point'
+            : 'none',
+      rawNode: item,
+    };
+  });
+};
+```
+
+这里体现了 Adapter 的价值：组件不需要知道 `recordStatus`、`eta`、`type` 怎么判断，只拿 `RouteItem` 渲染。
+
+---
+
+## 5. Adapter 2：历史记录 -> FulfillmentTaskNodeDTO
+
+文件：`HistoryByCar/historyRecord.adapter.ts`
+
+历史接口不直接返回 `FulfillmentTaskNodeDTO[]`，而是返回历史运输记录。适配器先把它转成统一履约节点：
+
+```ts
+export const buildHistoryFulfillmentTaskNodes = (
+  record,
+  businessAreaId?: string
+): FulfillmentTaskNodeDTO[] => {
+  const dispatchTime = formatTime(record?.dispatchTime);
+  const startPoint: FulfillmentTaskNodeDTO = {
+    deliveryImageNumber: 0,
+    stopoverPointDetailInfoDTO: {
+      staId: businessAreaId || 'history-start',
+      staName: record?.businessAreaTitle || '起点',
+      title: record?.businessAreaTitle || '起点',
+      type: StopOverPointType.START_POINT,
+      eta: dispatchTime ? `${dispatchTime} 已发车` : '已发车',
+    },
+  };
+
+  const routeNodes = (record?.transportAutoportRecords || []).map(
+    (transportItem, index, arr) => {
+      const title = getAutoportTitle(transportItem);
+
+      return {
+        deliveryImageNumber: 0,
+        stopoverPointDetailInfoDTO: {
+          eta: buildEtaText(transportItem),
+          staId: transportItem?.utpAutoportId || `history-node-${index}`,
+          staName: title,
+          title,
+          recordStatus: RecordStatusType[transportItem?.statusDesc],
+          type:
+            index === arr.length - 1
+              ? StopOverPointType.END_POINT
+              : StopOverPointType.POST_POINT,
+        },
+      };
+    }
+  );
+
+  return [startPoint, ...routeNodes];
+};
+```
+
+### 5.1 历史 ETA 文案适配
+
+```ts
+const buildEtaText = (transportItem) => {
+  const { statusDesc } = transportItem || {};
+
+  if (statusDesc === '取消') {
+    return '未到达';
+  }
+
+  if (statusDesc === '完成') {
+    const time = formatTime(transportItem?.actualFinishTime);
+    return time ? `${time} 已完成` : '已完成';
+  }
+
+  if (statusDesc === '停靠中') {
+    const time = formatTime(transportItem?.actualArriveTime);
+    return time ? `${time} 已到达` : '已到达';
+  }
+
+  if (['初始化', '已规划', '行驶中', '待执行'].includes(statusDesc)) {
+    const time = formatTime(transportItem?.estimateArriveTime);
+    const suffix = TransportStatusType[statusDesc] || '';
+    return time ? `${time} ${suffix}` : suffix;
+  }
+};
+```
+
+这解决了历史接口状态描述和 UI ETA 文案不一致的问题。
+
+### 5.2 历史列表中批量补节点
+
+`record-list.tsx`：
+
+```ts
+Object.values(histories)?.forEach(item => {
+  item.forEach(subItem => {
+    subItem.fulfillmentTaskNodeDTOS = buildHistoryFulfillmentTaskNodes(
+      subItem,
+      businessAreaId
+    );
+    subItem.title = subItem?.vkey || subItem?.udid;
+    subItem.vehicleId = subItem?.udid;
+    subItem.redirect = true;
+  });
+});
+```
+
+这样 `record-item-new` 就可以统一读 `data.fulfillmentTaskNodeDTOS`。
+
+---
+
+## 6. Adapter 3：车辆详情当前任务 -> RouteItem
+
+文件：`Vehicle/DetailMap/components/currentTaskCard.adapter.ts`
+
+车辆详情当前任务卡片使用 `CurrentTaskCard`：
+
+```tsx
+const routeItems = buildDetailTaskRouteItems(taskNodes);
+
+<TaskTimeline routeItems={routeItems} showIndex={false} showEta={true} />
+```
+
+### 6.1 进度解析
+
+```ts
+const resolveRouteProgress = (
+  taskNodes: FulfillmentTaskNodeDTO[]
+): RouteProgress => {
+  const progressIndex = taskNodes.findIndex((item) =>
+    isProgressStatus(getRecordStatus(item))
+  );
+  if (progressIndex > -1) {
+    return {
+      arrowIndex: progressIndex > 0 ? progressIndex - 1 : progressIndex,
+      arrowPosition: progressIndex > 0 ? 'line' : 'point',
+      activeLineIndex: progressIndex > 0 ? progressIndex - 1 : -1,
+      reachedIndex: progressIndex - 1,
+    };
+  }
+
+  const lastDoneIndex = taskNodes.reduce((lastIndex, item, index) => (
+    isDoneStatus(getRecordStatus(item)) ? index : lastIndex
+  ), -1);
+  if (lastDoneIndex > -1) {
+    return {
+      arrowIndex: lastDoneIndex,
+      arrowPosition: 'point',
+      activeLineIndex: -1,
+      reachedIndex: lastDoneIndex,
+    };
+  }
+
+  const lastArrivedIndex = findLastIndexByEta(taskNodes, '已到达');
+  if (lastArrivedIndex > -1) {
+    return {
+      arrowIndex: lastArrivedIndex,
+      arrowPosition: 'point',
+      activeLineIndex: -1,
+      reachedIndex: lastArrivedIndex,
+    };
+  }
+
+  const estimateIndex = taskNodes.findIndex((item) =>
+    getEta(item).includes('预计')
+  );
+  if (estimateIndex > -1) {
+    return {
+      arrowIndex: estimateIndex > 0 ? estimateIndex - 1 : estimateIndex,
+      arrowPosition: estimateIndex > 0 ? 'line' : 'point',
+      activeLineIndex: estimateIndex > 0 ? estimateIndex - 1 : -1,
+      reachedIndex: estimateIndex - 1,
+    };
+  }
+
+  return {
+    arrowIndex: taskNodes.length - 1,
+    arrowPosition: 'point',
+    activeLineIndex: -1,
+    reachedIndex: taskNodes.length - 1,
+  };
+};
+```
+
+和通用 adapter 类似，但它更强调“当前任务”的进行中状态和取消状态。
+
+### 6.2 转成 RouteItem
+
+```ts
+export const buildDetailTaskRouteItems = (
+  taskNodes?: FulfillmentTaskNodeDTO[]
+): RouteItem[] => {
+  if (!taskNodes?.length) return [];
+
+  const routeProgress = resolveRouteProgress(taskNodes);
+
+  return taskNodes.map((item, index) => {
+    const point = item.stopoverPointDetailInfoDTO;
+    const title = point?.title || point?.staName || '--';
+    const status = getRecordStatus(item);
+    const pointStatus: RouteItem['pointStatus'] = isCancelStatus(status)
+      ? 'cancel'
+      : index <= routeProgress.reachedIndex
+        ? 'done'
+        : 'pending';
+    const lineStatus: RouteItem['lineStatus'] =
+      index < routeProgress.reachedIndex
+        ? 'done'
+        : index === routeProgress.activeLineIndex
+          ? 'active'
+          : 'pending';
+    const arrowPosition =
+      index === routeProgress.arrowIndex ? routeProgress.arrowPosition : 'none';
+
+    return {
+      id: String(point?.staId || title || index),
+      title,
+      eta: point?.eta,
+      markerType: 'dot',
+      pointStatus,
+      lineStatus,
+      arrowPosition,
+      rawNode: item,
+    };
+  });
+};
+```
+
+这就是简历里“路线卡片复用同一渲染逻辑”的最直接证据：当前任务卡片不再自己写 dot/line/arrow 的判断，而是交给 `TaskTimeline`。
+
+---
+
+## 7. Adapter 4：发车确认 / 任务中车辆卡片 -> PendingTaskStepItem
+
+文件：`components/VehicleDetail/vehicleInfoCard.adapter.ts`
+
+这条线不是 `RouteItem`，而是服务于新的车辆详情卡片 `VehicleInfoCardNew` 内部的步骤条模型 `PendingTaskStepItem`。
+
+```ts
+export interface PendingTaskStepItem {
+  id: string;
+  name: string;
+  eta: string;
+  badge: string;
+  badgeType: 'start' | 'mid' | 'end';
+  isLast: boolean;
+  isPassed: boolean;
+  showArrow: boolean;
+  pointStatus?: TaskStepStatus;
+  lineStatus?: TaskStepStatus;
+  arrowPosition?: TaskStepArrowPosition;
+  showEta?: boolean;
+}
+```
+
+### 7.1 发车前：静态路线
+
+```ts
+export const buildPendingTaskSteps = (
+  stopoverPointListArray?: StopOverPointInfo[][]
+): PendingTaskStepItem[] => {
+  const merged = [fixedStartPoint, ...getTaskRoutePoints(stopoverPointListArray)];
+  const arrowPointIndex = 0;
+
+  return merged.map((item, idx) => {
+    const isFirst = idx === 0;
+    const isLast = idx === merged.length - 1;
+
+    return {
+      id: String(item.staId || idx),
+      name: item.staName || '',
+      eta: item.eta || '',
+      badge: isFirst ? '起' : isLast ? '终' : `${idx}`,
+      badgeType: isFirst ? 'start' : isLast ? 'end' : 'mid',
+      isLast,
+      isPassed: false,
+      showArrow: idx === arrowPointIndex,
+      pointStatus: 'pending',
+      lineStatus: isLast ? undefined : 'pending',
+      arrowPosition: idx === arrowPointIndex ? 'point' : 'none',
+      showEta: false,
+    };
+  });
+};
+```
+
+发车前没有真实执行状态，所以只展示规划路线：起点 + 任务点 + 返程点，箭头停在起点。
+
+### 7.2 发车后：动态路线
+
+```ts
+export const buildStartedTaskSteps = (
+  stopoverPointListArray?: StopOverPointInfo[][],
+  fulfillmentTaskNodeDTOS?: FulfillmentTaskNodeDTO[],
+  transportInfo?: TransportDetail
+): PendingTaskStepItem[] => {
+  const merged = getTaskRoutePoints(stopoverPointListArray);
+  const fulfillmentNodes = fulfillmentTaskNodeDTOS || [];
+  const routeSource = merged.length
+    ? [fixedStartPoint, ...merged]
+    : fulfillmentNodes.map((item) => {
+      const detail = item?.stopoverPointDetailInfoDTO;
+      return {
+        eta: detail?.eta,
+        staId: detail?.staId,
+        staName: detail?.title || detail?.staName || '',
+        type: detail?.type,
+      } as StopOverPointInfo;
+    });
+
+  if (!routeSource.length) return [];
+
+  const routeProgress = resolveStartedRouteProgress(
+    routeSource,
+    fulfillmentNodes,
+    transportInfo
+  );
+
+  return routeSource.map((item, idx) => {
+    const isFirst = idx === 0;
+    const isLast = idx === routeSource.length - 1;
+    const matchedNode = findFulfillmentNode(fulfillmentNodes, item, idx);
+    const status = buildStepStatus(idx, routeProgress, isLast);
+
+    return {
+      id: String(item.staId || item.utpAutoportId || idx),
+      name: item.staName || '',
+      eta: getPointEta(matchedNode, transportInfo, item),
+      badge: isFirst ? '起' : isLast ? '终' : `${idx}`,
+      badgeType: isFirst ? 'start' : isLast ? 'end' : 'mid',
+      isLast,
+      isPassed: status.lineStatus === 'done',
+      showArrow: status.arrowPosition !== 'none',
+      showEta: true,
+      ...status,
+    };
+  });
+};
+```
+
+这里处理了两种输入：
+
+- 如果页面还有 `stopoverPointListArray`，优先基于本地路线源展示。
+- 如果刷新后本地路线源没了，用后端 `fulfillmentTaskNodeDTOS` 兜底恢复。
+
+这和发车成功后独立 `TaskProgress` 页面“刷新状态不丢”的设计是配套的。
+
+### 7.3 车辆卡片中使用
+
+`vehicleInfoCard.tsx`：
+
+```ts
+const pendingTaskSteps = buildPendingTaskSteps(stopoverPointListArray);
+const startedTaskSteps = buildStartedTaskSteps(
+  stopoverPointListArray,
+  fulfillmentTaskNodeDTOS,
+  transportInfo
+);
+const routeSteps = isTaskStarted ? startedTaskSteps : pendingTaskSteps;
+```
+
+然后统一渲染：
+
+```tsx
+{routeSteps.map((step) => (
+  <div className="nvc__step" key={step.id}>
+    ...
+    <span className="nvc__step-name">{step.name}</span>
+    {step.showEta && step.eta && (
+      <span className="nvc__step-eta">{step.eta}</span>
+    )}
+  </div>
+))}
+```
+
+这也是 Adapter 模式：组件不关心发车前 / 发车后数据差异，只关心 `routeSteps`。
+
+---
+
+## 8. TaskTimeline：统一渲染层
+
+`TaskTimeline` 支持双输入：
+
+```ts
+interface TaskTimelineProps {
+  taskNodes?: FulfillmentTaskNodeDTO[];
+  routeItems?: RouteItem[];
+  showIndex?: boolean;
+  showEta?: boolean;
+  renderRight?: (
+    node: FulfillmentTaskNodeDTO | undefined,
+    index: number,
+    routeItem?: RouteItem
+  ) => ReactNode;
+  onNodeClick?: (
+    node: FulfillmentTaskNodeDTO | undefined,
+    index: number,
+    routeItem?: RouteItem
+  ) => void;
+}
+```
+
+核心决策：
+
+```ts
+const items =
+  routeItems?.length
+    ? routeItems
+    : buildRouteItemsFromTaskNodes(taskNodes, { showIndex });
+```
+
+这是一种渐进式重构设计：
+
+- 新页面可以直接传 `routeItems`，完全走 adapter。
+- 老页面可以先传 `taskNodes`，组件内部帮忙适配。
+- 等迁移完成后，理想状态是统一只传 `routeItems`。
+
+### 8.1 点、线、箭头渲染
+
+```tsx
+const showPointArrow = routeItem.arrowPosition === 'point';
+const showLineArrow = routeItem.arrowPosition === 'line' && !isLast;
+```
+
+点上箭头：
+
+```tsx
+{showPointArrow && (
+  <img className="task-timeline-arrow" src={ACTIVE_ARROW_ICON_URL} alt="" />
+)}
+```
+
+线中箭头：
+
+```tsx
+{showLineArrow && (
+  <>
+    <span className="task-timeline-line-top task-timeline-line--reached" />
+    <img className="task-timeline-line-arrow" src={ACTIVE_ARROW_ICON_URL} alt="" />
+    <span className="task-timeline-line-bottom task-timeline-line--pending" />
+  </>
+)}
+```
+
+这里的好处是：箭头位置由数据决定，组件只做渲染。
+
+### 8.2 右侧内容可插拔
+
+```tsx
+{renderRight ? (
+  renderRight(item, index, routeItem)
+) : showEta ? (
+  <>
+    <span className="task-timeline-time">{time}</span>
+    <span className="task-timeline-label">{label}</span>
+  </>
+) : null}
+```
+
+这让同一个时间线可以适配不同页面：
+
+- 当前任务：展示 ETA。
+- 简洁卡片：不展示 ETA。
+- 历史详情：自定义右侧标签、图片数、操作入口。
+
+---
+
+## 9. “4 个数据适配层”怎么对应简历
+
+可以这样归纳：
+
+| 适配层 | 文件 | 输入 | 输出 | 解决的问题 |
+|--------|------|------|------|------------|
+| 1. 通用任务节点 adapter | `TaskTimeline/adapters.ts` | `FulfillmentTaskNodeDTO[]` | `RouteItem[]` | 标准化点/线/箭头状态 |
+| 2. 历史记录 adapter | `HistoryByCar/historyRecord.adapter.ts` | 历史记录 `transportAutoportRecords` | `FulfillmentTaskNodeDTO[]` | 历史接口结构不一致 |
+| 3. 详情当前任务 adapter | `currentTaskCard.adapter.ts` | 实时 `taskNodes` | `RouteItem[]` | 当前任务卡片进度、取消、箭头位置 |
+| 4. 车辆信息卡片 adapter | `vehicleInfoCard.adapter.ts` | `stopoverPointListArray`、`fulfillmentTaskNodeDTOS`、`transportInfo` | `PendingTaskStepItem[]` | 发车前静态路线和发车后动态路线切换 |
+
+严格说，第 4 个输出不是 `RouteItem[]`，而是 `PendingTaskStepItem[]`，但它同样是 Adapter 模式：把异构业务数据转换成 UI 标准模型。面试时可以说“项目里存在两套路线 UI 模型：通用 `TaskTimeline` 的 `RouteItem`，以及车辆卡片内部的 `PendingTaskStepItem`，思想一致，都是 DTO -> UI model”。
+
+---
+
+## 10. 当前代码事实：哪些已迁移，哪些仍是旧逻辑
+
+### 10.1 已经使用 TaskTimeline 的链路
+
+车辆详情当前任务：
+
+```tsx
+const routeItems = buildDetailTaskRouteItems(taskNodes);
+<TaskTimeline routeItems={routeItems} showIndex={false} showEta={true} />
+```
+
+页面链路：
+
+```txt
+DetailMap
+  -> DetailTaskSection
+  -> CurrentTaskCard
+  -> buildDetailTaskRouteItems
+  -> TaskTimeline
+```
+
+### 10.2 历史记录已做标准节点适配，但渲染还走旧 TaskRoute
+
+`record-list.tsx` 已经：
+
+```ts
+subItem.fulfillmentTaskNodeDTOS = buildHistoryFulfillmentTaskNodes(subItem, businessAreaId);
+```
+
+但 `record-item-new.tsx` 当前仍然：
+
+```tsx
+<TaskRoute
+  fulfillmentTaskNodeDTOS={data?.fulfillmentTaskNodeDTOS}
+  taskLogInfoDTOS={data.taskLogInfoDTOS}
+  staId={staId}
+/>
+```
+
+也就是说历史数据适配已经完成，但部分渲染仍在旧 `TaskRoute`。这可以作为后续迁移点。
+
+### 10.3 发车确认 / 任务进行中车辆卡片走 VehicleInfoCard adapter
+
+`TaskProgress` 查询运输详情后生成 `fulfillmentTaskNodeDTOS`，传给 `VehicleDetail`：
+
+```tsx
+<VehicleDetail
+  isTaskStarted={true}
+  transportInfo={transportInfo}
+  fulfillmentTaskNodeDTOS={fulfillmentTaskNodeDTOS}
+/>
+```
+
+`VehicleDetail` 透传给 `VehicleInfoCard`，再由 `vehicleInfoCard.adapter.ts` 转成 `routeSteps`。
+
+---
+
+## 11. 面试里怎么讲“降低成本”
+
+你可以从三个成本讲：
+
+### 11.1 状态扩展成本
+
+以前如果新增一个状态，比如“取消”、“进行中线段”、“已到达但未完成”，每个页面都要改自己的 if/else。现在只需要在 adapter 里把它映射成：
+
+```ts
+pointStatus: 'cancel',
+lineStatus: 'pending',
+arrowPosition: 'none'
+```
+
+渲染层不用知道后端状态名。
+
+### 11.2 样式调整成本
+
+以前要改路线圆点、连线、箭头样式，要在多个 JSX / SCSS 里找。现在 `TaskTimeline` 的样式集中在：
+
+```txt
+TaskTimeline/index.tsx
+TaskTimeline/index.scss
+```
+
+同一套类名：
+
+```scss
+.task-timeline-line--reached
+.task-timeline-line--active
+.task-timeline-line--pending
+.task-timeline-line--cancel
+```
+
+### 11.3 数据接口变更成本
+
+如果历史接口字段改了，只改 `historyRecord.adapter.ts`；如果实时节点状态字段改了，只改 `TaskTimeline/adapters.ts` 或 `currentTaskCard.adapter.ts`。组件不需要跟着接口结构变。
+
+---
+
+## 12. 当前不足 / 后续优化点
+
+### 12.1 `TaskTimeline` 还没有完全替代旧 `TaskRoute`
+
+旧 `taskRoute` 仍然被历史卡片使用。后续可以把历史卡片也迁到：
+
+```tsx
+const routeItems = buildRouteItemsFromTaskNodes(data.fulfillmentTaskNodeDTOS, {
+  showIndex: true,
+});
+
+<TaskTimeline
+  routeItems={routeItems}
+  showIndex
+  renderRight={...图片数量 / ETA...}
+/>
+```
+
+这样旧 `TaskRoute` 的内联状态判断可以删除。
+
+### 12.2 `TaskTimeline` README 的 active 说明滞后
+
+README 还写“优先 ETA 包含预计 / 已到达”，但当前代码已优先 `recordStatus=InProgress` 和最后一个 `DONE`。后续应该同步文档。
+
+### 12.3 `VehicleInfoCard.adapter` 只取了 `[0]` 和 `[2]`
+
+```ts
+const getTaskRoutePoints = (...) => [
+  ...(stopoverPointListArray?.[0] || []),
+  ...(stopoverPointListArray?.[2] || []),
+];
+```
+
+如果后续重新开放揽收段展示，需要把 `[1]` 也拼进去。
+
+### 12.4 两套路由 UI 模型可以进一步统一
+
+当前有：
+
+- `RouteItem`：用于 `TaskTimeline`
+- `PendingTaskStepItem`：用于 `VehicleInfoCardNew`
+
+它们结构相似，都有点状态、线状态、箭头位置。后续可以考虑把 `PendingTaskStepItem` 也收敛成 `RouteItem`，让车辆卡片也复用 `TaskTimeline` 或同一个 adapter 工具。
+
+---
+
+## 13. 面试高频追问答案
+
+### Q1：Adapter 模式在这里具体解决了什么？
+
+解决“同一个路线 UI 面对多种后端数据结构”的问题。没有 Adapter，组件要认识历史记录、实时任务、发车规划等多种 DTO；有 Adapter 后，组件只认识标准 UI 模型，DTO 差异被隔离在对应 adapter 里。
+
+### Q2：为什么要把点状态、线状态、箭头位置拆开？
+
+因为路线时间线不是单一状态。一个节点可能已经完成，但它下面的线段正在行驶；箭头可能出现在节点上，也可能出现在两个节点之间。拆成 `pointStatus / lineStatus / arrowPosition` 后，可以组合表达这些中间态，不需要不断新增枚举。
+
+### Q3：为什么 `TaskTimeline` 同时支持 `taskNodes` 和 `routeItems`？
+
+这是渐进式重构的兼容设计。新链路优先传 `routeItems`，旧链路可以暂时传 `taskNodes`，由组件内部 adapter 转换。这样不用一次性迁移所有页面，降低上线风险。理想状态是后续统一为 `routeItems`。
+
+### Q4：历史记录为什么先转成 `FulfillmentTaskNodeDTO[]`，不直接转 `RouteItem[]`？
+
+因为项目里原有很多组件已经认识 `FulfillmentTaskNodeDTO[]`，先把历史接口转成这个中间标准节点，可以让历史记录先接入现有路线组件，迁移成本更低。后续如果全部迁到 `TaskTimeline`，可以进一步直接输出 `RouteItem[]`。
+
+### Q5：`rawNode` 会不会破坏解耦？
+
+有一点耦合风险，但它是有控制的逃生口。标准字段满足主渲染，特殊场景需要原始 DTO 的图片数量、日志等字段时可以读取 `rawNode`，避免把 `RouteItem` 设计得过胖。团队约定是优先用标准字段，只有确实需要时才读 `rawNode`。
+
+### Q6：这次重构带来的收益怎么量化？
+
+可以从维护点减少来讲：原来多个页面各自维护点/线/箭头判断，改状态和样式要多处同步；重构后状态推导集中在 adapter，样式集中在 `TaskTimeline`。后续新增状态或调整样式，只需要改一处 adapter 或一个组件，减少重复修改和不一致风险。
+
+### Q7：你在这个重构里最有技术含量的部分是什么？
+
+不是抽组件本身，而是识别出“路线卡片”的稳定 UI 模型，并把后端 DTO 的变化隔离到 adapter。尤其是把路线状态拆成点、线、箭头三个维度，让组件能表达复杂过程状态。
+
+### Q8：如果后端新增一种任务节点类型怎么办？
+
+如果只是显示名称和编号不同，改 adapter 的 `markerType / markerLabel` 映射即可；如果视觉状态不同，扩展 `RouteVisualStatus` 或在 adapter 里映射到已有状态。渲染组件不需要直接接触后端新字段。
+
+---
+
+## 14. 可以直接放进简历的优化表述
+
+如果只写一条：
+
+> 主导无人车任务路线卡片重构，针对车辆详情、任务进行中、历史记录、发车确认等多链路任务节点结构不一致的问题，引入 Adapter 模式将 `transportAutoports / transportAutoportRecords / fulfillmentTaskNodeDTOS / stopoverPointListArray` 统一转换为路线 UI 模型，抽象 `pointStatus / lineStatus / arrowPosition` 三维状态，复用 `TaskTimeline` 渲染点、线、箭头和 ETA，降低状态扩展和样式维护成本。
+
+如果拆成两条：
+
+> 设计路线卡片标准 UI 模型 `RouteItem`，将圆点状态、连线状态、箭头位置拆分为独立维度，解决任务节点“已完成 / 进行中 / 待到达 / 取消”等组合状态难以复用的问题。
+>
+> 新增多数据源 Adapter 层，分别适配实时履约节点、历史运输记录、车辆详情当前任务和发车确认路线，将异构 DTO 转换为标准路线模型，推动当前任务卡片复用 `TaskTimeline`，减少多页面重复 JSX 和状态判断。
+
+---
+
+## 15. 复盘关键词
+
+- Adapter 模式
+- DTO -> UI Model
+- `RouteItem`
+- `RouteMarkerType`
+- `RouteVisualStatus`
+- `RouteArrowPosition`
+- `pointStatus`
+- `lineStatus`
+- `arrowPosition`
+- `TaskTimeline`
+- `taskNodes`
+- `routeItems`
+- `rawNode`
+- `FulfillmentTaskNodeDTO`
+- `stopoverPointDetailInfoDTO`
+- `buildRouteItemsFromTaskNodes`
+- `getTaskTimelineActiveIndex`
+- `normalizeRecordStatus`
+- `buildHistoryFulfillmentTaskNodes`
+- `buildDetailTaskRouteItems`
+- `buildPendingTaskSteps`
+- `buildStartedTaskSteps`
+- `stopoverPointListArray`
+- `transportAutoports`
+- `transportAutoportRecords`
+- `recordStatus`
+- `statusDesc`
+- `ETA`
+- 迁移旧 `TaskRoute`
+- 渐进式重构
+
