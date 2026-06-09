@@ -1,0 +1,759 @@
+# 简历第四点详解：Adapter 模式路线卡片重构
+
+  
+
+> 简历原文：主导路线卡片组件重构，引入 Adapter 设计模式将 DTO 与 UI 模型解耦；抽象 `RouteItem` 三维状态类型（`pointStatus` / `lineStatus` / `arrowPosition`），统一 3 处独立实现，封装通用 `TaskTimeline` 组件，历史/实时页面复用同一套渲染逻辑
+
+  
+
+---
+
+  
+
+## 一、重构背景：为什么要做这件事？
+
+  
+
+重构前，路线卡片（站点时间线）在三处独立实现：
+
+  
+
+| 页面 | 实现方式 | 问题 |
+
+|------|----------|------|
+
+| 车辆详情页（实时） | 直接读 `transportAutoports` 字段，在模板里 if/else 判状态 | DTO 字段和 UI 状态耦合，改后端字段名会扩散到模板 |
+
+| 车辆列表页（卡片内） | 内联 JSX，独立的 eta 格式化逻辑 | 格式化函数重复，维护两份 |
+
+| 历史记录页 | 自己拼接站点数据，和实时页逻辑完全不同结构 | 完全割裂，bug 修复需要改三处 |
+
+  
+
+**核心问题：数据来源不同（实时 API vs 历史 API），但最终渲染的 UI 是一样的。**
+
+  
+
+重构目标：用 Adapter 模式，把不同数据源都转换成统一的 `RouteItem[]`，由同一个 `TaskTimeline` 组件负责渲染。
+
+  
+
+---
+
+  
+
+## 二、整体架构
+
+  
+
+```
+
+后端 DTO（实时） 后端 DTO（历史）
+
+FulfillmentTaskNodeDTO[] HistoryRecord（transportAutoportRecords[]）
+
+│ │
+
+▼ ▼
+
+buildRouteItemsFromTaskNodes() buildHistoryFulfillmentTaskNodes()
+
+[TaskTimeline/adapters.ts] [HistoryByCar/historyRecord.adapter.ts]
+
+│ │
+
+└────────────┬─────────────────────┘
+
+▼
+
+RouteItem[] （统一 UI 模型）
+
+│
+
+▼
+
+<TaskTimeline />
+
+[components/TaskTimeline/index.tsx]
+
+```
+
+  
+
+---
+
+  
+
+## 三、RouteItem：三维状态类型系统
+
+  
+
+**文件：** [src/pages/UnmannedVehicleNew/components/TaskTimeline/types.ts](src/pages/UnmannedVehicleNew/components/TaskTimeline/types.ts)
+
+  
+
+```typescript
+
+// 圆点形状：纯点 | 起点标签 | 终点标签 | 编号
+
+type RouteMarkerType = 'dot' | 'start' | 'end' | 'index';
+
+  
+
+// 视觉状态（用于颜色：蓝=active/pending，灰=done，红=cancel）
+
+type RouteVisualStatus = 'done' | 'active' | 'pending' | 'cancel';
+
+  
+
+// 箭头位置
+
+type RouteArrowPosition = 'none' | 'line' | 'point';
+
+  
+
+interface RouteItem {
+
+id: string;
+
+title: string;
+
+eta?: string;
+
+markerType?: RouteMarkerType; // 维度1：圆点外形
+
+markerLabel?: string;
+
+pointStatus?: RouteVisualStatus; // 维度2：圆点颜色状态
+
+lineStatus?: RouteVisualStatus; // 维度3：连接线颜色状态
+
+arrowPosition?: RouteArrowPosition; // 箭头位置（当前站点）
+
+isCurrentStation?: boolean;
+
+imageCount?: number;
+
+rawNode?: FulfillmentTaskNodeDTO; // 保留原始 DTO，供渲染时按需读取
+
+}
+
+```
+
+  
+
+**三维独立**的设计意义：
+
+- `pointStatus` 只控制圆点颜色，独立于线
+
+- `lineStatus` 只控制线段颜色，独立于圆点
+
+- `arrowPosition` 控制动态箭头出现在圆点上方（`point`）还是线段中间（`line`）
+
+  
+
+这样可以精确表达"圆点已完成但线段还未走完"的中间状态，用 `pointStatus: 'done', lineStatus: 'active'` 即可，不需要额外的枚举值。
+
+  
+
+---
+
+  
+
+## 四、Adapter 1：实时数据 → RouteItem[]
+
+  
+
+**文件：** [src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts](src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts)
+
+  
+
+### 4.1 找当前活跃站点
+
+  
+
+```typescript
+
+export const getTaskTimelineActiveIndex = (taskNodes: FulfillmentTaskNodeDTO[]) => {
+
+// 优先找"预计到达"（行驶中，当前目标站）
+
+const estimateIndex = taskNodes.findIndex((item) =>
+
+item.stopoverPointDetailInfoDTO?.eta?.includes('预计')
+
+);
+
+if (estimateIndex > -1) return estimateIndex;
+
+  
+
+// 其次找"已到达"（停靠中）
+
+const arrivedIndex = taskNodes.findIndex((item) =>
+
+item.stopoverPointDetailInfoDTO?.eta?.includes('已到达')
+
+);
+
+if (arrivedIndex > -1) return arrivedIndex;
+
+  
+
+// 兜底：最后一个节点
+
+return taskNodes.length - 1;
+
+};
+
+```
+
+  
+
+> **逻辑**：通过 ETA 文本中的关键词来判断当前活跃站点，而不是依赖独立的状态字段，因为后端在 `eta` 字段里已经编码了状态信息。
+
+  
+
+### 4.2 构建 RouteItem[]
+
+  
+
+```typescript
+
+export const buildRouteItemsFromTaskNodes = (
+
+taskNodes: FulfillmentTaskNodeDTO[],
+
+options?: { showIndex?: boolean }
+
+): RouteItem[] => {
+
+if (!taskNodes?.length) return [];
+
+  
+
+const { showIndex = false } = options || {};
+
+const activeIndex = getTaskTimelineActiveIndex(taskNodes);
+
+let postCounter = 0;
+
+  
+
+return taskNodes.map((item, index) => {
+
+const point = item.stopoverPointDetailInfoDTO;
+
+const type = point?.type;
+
+const isUpcoming = index >= activeIndex; // activeIndex 之后都是"待到达"
+
+  
+
+if (showIndex && type !== 'START_POINT' && type !== 'END_POINT') postCounter++;
+
+  
+
+const markerType = showIndex
+
+? type === 'START_POINT' ? 'start'
+
+: type === 'END_POINT' ? 'end'
+
+: 'index'
+
+: 'dot';
+
+  
+
+return {
+
+id: String(point?.staId || point?.title || index),
+
+title: point?.title || point?.staName || '--',
+
+eta: point?.eta,
+
+markerType,
+
+markerLabel: showIndex ? getTaskTimelineIndexLabel(item, postCounter) : '',
+
+pointStatus: isUpcoming ? 'active' : 'done', // activeIndex 前：done（蓝实）
+
+lineStatus: index >= activeIndex ? 'active' : 'done', // 同上
+
+arrowPosition: index === activeIndex ? 'point' : 'none', // 只有当前站点有箭头
+
+rawNode: item, // 保留原始 DTO
+
+};
+
+});
+
+};
+
+```
+
+  
+
+---
+
+  
+
+## 五、Adapter 2：历史数据 → FulfillmentTaskNodeDTO[]
+
+  
+
+**文件：** [src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts](src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts)
+
+  
+
+历史数据结构与实时数据完全不同，通过 Adapter 转换成 `FulfillmentTaskNodeDTO[]`，再交给 `TaskTimeline` 的 `taskNodes` prop，最终走同一套渲染路径。
+
+  
+
+### 5.1 ETA 文本构建：按状态分支
+
+  
+
+```typescript
+
+const buildEtaText = (transportItem) => {
+
+const { statusDesc } = transportItem || {};
+
+  
+
+if (statusDesc === '取消') return '未到达'; // 取消站点
+
+  
+
+if (statusDesc === '完成') {
+
+const time = formatTime(transportItem?.actualFinishTime);
+
+return time ? `${time} 已完成` : '已完成'; // e.g. "14:30 已完成"
+
+}
+
+  
+
+if (statusDesc === '停靠中') {
+
+const time = formatTime(transportItem?.actualArriveTime);
+
+return time ? `${time} 已到达` : '已到达'; // e.g. "14:25 已到达"
+
+}
+
+  
+
+if (['初始化', '已规划', '行驶中', '待执行'].includes(statusDesc)) {
+
+const time = formatTime(transportItem?.estimateArriveTime);
+
+const suffix = TransportStatusType[statusDesc] || '';
+
+return time ? `${time} ${suffix}` : suffix; // e.g. "14:35 预计到达"
+
+}
+
+  
+
+// 兜底：按优先级取时间字段
+
+const fallbackTime =
+
+formatTime(transportItem?.actualArriveTime)
+
+|| formatTime(transportItem?.actualFinishTime)
+
+|| formatTime(transportItem?.estimateArriveTime);
+
+return fallbackTime
+
+? `${fallbackTime} ${TransportStatusType[statusDesc] || statusDesc || ''}`.trim()
+
+: (TransportStatusType[statusDesc] || statusDesc || '');
+
+};
+
+```
+
+  
+
+### 5.2 站点名称三级兜底
+
+  
+
+```typescript
+
+const getAutoportTitle = (transportItem) =>
+
+transportItem?.utpAutoportTitle // 优先：业务站点名称
+
+|| transportItem?.positionName // 其次：地理位置名
+
+|| transportItem?.departmentName // 再次：部门名称
+
+|| '未命名站点'; // 兜底
+
+```
+
+  
+
+### 5.3 拼装完整节点数组
+
+  
+
+```typescript
+
+export const buildHistoryFulfillmentTaskNodes = (
+
+record,
+
+businessAreaId?: string
+
+): FulfillmentTaskNodeDTO[] => {
+
+const dispatchTime = formatTime(record?.dispatchTime);
+
+  
+
+// 起始点（从门店出发）
+
+const startPoint: FulfillmentTaskNodeDTO = {
+
+deliveryImageNumber: 0,
+
+stopoverPointDetailInfoDTO: {
+
+staId: businessAreaId || 'history-start',
+
+staName: record?.businessAreaTitle || '起点',
+
+title: record?.businessAreaTitle || '起点',
+
+type: StopOverPointType.START_POINT,
+
+eta: dispatchTime ? `${dispatchTime} 已发车` : '已发车',
+
+},
+
+};
+
+  
+
+const routeNodes = (record?.transportAutoportRecords || []).map(
+
+(transportItem, index, arr) => ({
+
+deliveryImageNumber: 0,
+
+stopoverPointDetailInfoDTO: {
+
+eta: buildEtaText(transportItem),
+
+staId: transportItem?.utpAutoportId || `history-node-${index}`,
+
+staName: getAutoportTitle(transportItem),
+
+title: getAutoportTitle(transportItem),
+
+recordStatus: RecordStatusType[transportItem?.statusDesc],
+
+// 最后一个节点标记为终点
+
+type: index === arr.length - 1
+
+? StopOverPointType.END_POINT
+
+: StopOverPointType.POST_POINT,
+
+},
+
+})
+
+);
+
+  
+
+return [startPoint, ...routeNodes];
+
+};
+
+```
+
+  
+
+---
+
+  
+
+## 六、TaskTimeline 组件：双输入模式
+
+  
+
+**文件：** [src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx](src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx)
+
+  
+
+```typescript
+
+interface TaskTimelineProps {
+
+taskNodes?: FulfillmentTaskNodeDTO[]; // 模式A：传原始 DTO，组件内部调 Adapter
+
+routeItems?: RouteItem[]; // 模式B：外部已经转好了，直接传 RouteItem[]
+
+showIndex?: boolean; // 是否显示编号（起/1/2/终）
+
+showEta?: boolean; // 是否显示右侧时间
+
+renderRight?: (node, index, routeItem) => ReactNode; // 自定义右侧内容
+
+onNodeClick?: (node, index, routeItem) => void;
+
+}
+
+  
+
+const TaskTimeline: React.FC<TaskTimelineProps> = (props) => {
+
+// 决策：routeItems 优先，没有则由 taskNodes 通过 Adapter 生成
+
+const items = routeItems?.length
+
+? routeItems
+
+: buildRouteItemsFromTaskNodes(taskNodes, { showIndex });
+
+  
+
+// ...渲染逻辑
+
+};
+
+```
+
+  
+
+**两种调用方式：**
+
+  
+
+```tsx
+
+// 模式A：传原始 DTO（实时详情页）
+
+<TaskTimeline taskNodes={fulfillmentTaskNodes} showIndex />
+
+  
+
+// 模式B：外部先转换（历史页，需要自定义额外逻辑）
+
+const routeItems = buildRouteItemsFromTaskNodes(
+
+buildHistoryFulfillmentTaskNodes(record, businessAreaId)
+
+);
+
+<TaskTimeline routeItems={routeItems} showEta={false} renderRight={...} />
+
+```
+
+  
+
+### 6.1 箭头渲染逻辑
+
+  
+
+```tsx
+
+const showPointArrow = routeItem.arrowPosition === 'point'; // 箭头在圆点上方
+
+const showLineArrow = routeItem.arrowPosition === 'line' && !isLast; // 箭头在线段中间
+
+  
+
+return (
+
+<div className="task-timeline-left">
+
+{showPointArrow && (
+
+<img className="task-timeline-arrow" src={ACTIVE_ARROW_ICON_URL} />
+
+)}
+
+{/* 圆点 */}
+
+<span className={`task-timeline-dot task-timeline-dot--${isUpcoming ? 'upcoming' : 'reached'}`} />
+
+  
+
+{/* 连接线（含线中箭头）*/}
+
+{!isLast && (
+
+<span className={`task-timeline-line ${showLineArrow ? 'task-timeline-line--split' : ''} ...`}>
+
+{showLineArrow && (
+
+<>
+
+<span className="task-timeline-line-top task-timeline-line--reached" />
+
+<img className="task-timeline-line-arrow" src={ACTIVE_ARROW_ICON_URL} />
+
+<span className="task-timeline-line-bottom task-timeline-line--upcoming" />
+
+</>
+
+)}
+
+</span>
+
+)}
+
+</div>
+
+);
+
+```
+
+  
+
+**视觉效果对应：**
+
+  
+
+| `arrowPosition` | 视觉 |
+
+|-----------------|------|
+
+| `'none'` | 仅圆点 + 线段，无箭头 |
+
+| `'point'` | 圆点上方有向下箭头（当前正在前往的站点） |
+
+| `'line'` | 线段中间有向下箭头，线分为上半段（已走，蓝）和下半段（未走，灰） |
+
+  
+
+---
+
+  
+
+## 七、渐进式重构三步走
+
+  
+
+重构不是一次性替换，而是三步逐步完成：
+
+  
+
+**Step 1：提取类型定义**
+
+- 新建 `TaskTimeline/types.ts`，定义 `RouteItem`、`RouteMarkerType`、`RouteVisualStatus`、`RouteArrowPosition`
+
+- 不改任何现有代码，零风险
+
+  
+
+**Step 2：新增 Adapter 层**
+
+- 新建 `TaskTimeline/adapters.ts`，实现 `buildRouteItemsFromTaskNodes`、`getTaskTimelineActiveIndex`
+
+- 历史记录页新增 `historyRecord.adapter.ts`，实现 `buildHistoryFulfillmentTaskNodes`
+
+- 在 `TaskTimeline` 组件中支持 `routeItems` prop（向后兼容原有 `taskNodes` prop）
+
+  
+
+**Step 3：逐页迁移**
+
+- 先迁移历史页（逻辑最独立），验证 Adapter 正确
+
+- 再迁移列表页卡片内的时间线
+
+- 最后迁移详情页（最复杂，依赖实时轮询数据）
+
+- 各页面可独立回滚，不影响其他页面
+
+  
+
+---
+
+  
+
+## 八、面试问答
+
+  
+
+**Q1：Adapter 模式在这里解决了什么具体问题？**
+
+  
+
+A：核心问题是"同一个 UI 组件需要渲染来自不同数据结构的数据"。实时页后端返回 `FulfillmentTaskNodeDTO[]`，历史页后端返回完全不同的 `HistoryRecord` 结构。没有 Adapter 时，`TaskTimeline` 组件内部需要用 if/else 分别处理两套数据，职责混乱且难以测试。引入 Adapter 后，`TaskTimeline` 只认识 `RouteItem[]`，数据来源的差异完全被 Adapter 屏蔽，组件代码简洁，两个 Adapter 也可以独立单测。
+
+  
+
+**Q2：`RouteItem` 为什么把 `pointStatus`、`lineStatus`、`arrowPosition` 分成三个独立字段？用一个枚举不行吗？**
+
+  
+
+A：用一个枚举（比如 `status: 'done' | 'active' | 'current'`）无法精确表达"圆点已到达，但线段还在行进中"的中间状态，以及"当前站的箭头应该在圆点上方还是线段中间"这类箭头位置需求。三维独立让渲染层可以组合任意状态，不需要为每种组合增加新的枚举值，扩展性更好。类比 CSS 把 `color`、`background`、`border` 分开声明，而不是用一个 `style` 枚举。
+
+  
+
+**Q3：`getTaskTimelineActiveIndex` 通过 ETA 文本字符串判断状态，而不是用独立的 status 字段，这个设计合理吗？**
+
+  
+
+A：是一种权衡。后端 `stopoverPointDetailInfoDTO` 结构里已有 `recordStatus` 字段，但不同场景下 `recordStatus` 的枚举值不完全统一（历史和实时由不同接口返回）。而 ETA 文本是后端在 `eta` 字段里统一编码的，包含"预计"/"已到达"等关键词，跨场景稳定。用文本匹配的代价是和语言绑定（如果 UI 语言变了要改），好处是复用后端已有的字段，不需要额外字段。在实际项目中，这是在"字段利用率"和"解耦程度"之间的实用取舍。
+
+  
+
+**Q4：`TaskTimeline` 同时支持 `taskNodes` 和 `routeItems` 两种 prop，这是不是接口设计不清晰？**
+
+  
+
+A：是渐进式重构期间的权衡设计。在重构期，部分页面还未迁移，同时支持两种输入保证了向后兼容。优先级规则明确：`routeItems` 非空则使用，否则内部调 Adapter 处理 `taskNodes`。重构完成后理想状态是只保留 `routeItems`，但在实际项目里"重构完成"往往需要时间，这种两档兼容是常见的工程实践。如果面试官追问，可以说"后续计划废弃 `taskNodes` prop，统一为 `routeItems`，但优先保证稳定性"。
+
+  
+
+**Q5：`rawNode` 字段把原始 DTO 存在 `RouteItem` 里，这不是又引入了耦合吗？**
+
+  
+
+A：是刻意保留的"逃生口"。`RouteItem` 的字段覆盖了 80% 的渲染需求，但个别页面需要访问原始 DTO 里的更多字段（比如点击站点弹窗需要显示配送图片数量 `deliveryImageNumber`）。如果强制要求所有字段都 map 到 `RouteItem`，Adapter 会变得很胖，而且每次新增渲染需求都要改 Adapter 和 `RouteItem` 类型。`rawNode` 让组件可以按需读取原始数据，同时 `RouteItem` 保持精简。代价是 `TaskTimeline` 内部可能会偶尔读 `rawNode`，需要团队约定仅在万不得已时使用。
+
+  
+
+---
+
+  
+
+## 九、代码索引
+
+  
+
+| 功能 | 文件 | 行号 |
+
+|------|------|------|
+
+| RouteItem 类型定义 | [src/pages/UnmannedVehicleNew/components/TaskTimeline/types.ts](src/pages/UnmannedVehicleNew/components/TaskTimeline/types.ts) | 1-19 |
+
+| getTaskTimelineActiveIndex | [src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts](src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts) | 15-29 |
+
+| buildRouteItemsFromTaskNodes | [src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts](src/pages/UnmannedVehicleNew/components/TaskTimeline/adapters.ts) | 41-86 |
+
+| TaskTimeline 组件（双输入模式）| [src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx](src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx) | 36-185 |
+
+| TaskTimeline 箭头渲染 | [src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx](src/pages/UnmannedVehicleNew/components/TaskTimeline/index.tsx) | 88-163 |
+
+| buildHistoryFulfillmentTaskNodes | [src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts](src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts) | 58-96 |
+
+| buildEtaText（历史 ETA）| [src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts](src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts) | 15-50 |
+
+| getAutoportTitle（三级兜底）| [src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts](src/pages/UnmannedVehicleNew/HistoryByCar/historyRecord.adapter.ts) | 52-56 |
