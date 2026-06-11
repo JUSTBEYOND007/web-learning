@@ -1,0 +1,111 @@
+``` js
+### 6.1 POINT 转 Marker
+
+```ts
+const pointMatch = wkt.match(/POINT\s*\(\s*([\d.]+)\s+([\d.]+)\s*\)/i);
+if (pointMatch) {
+  const lng = parseFloat(pointMatch[1]);
+  const lat = parseFloat(pointMatch[2]);
+
+  const marker = new AMap.Marker({
+    position: [lng, lat],
+    zIndex: config.zIndex || 100,
+    offset: config.offset ? new AMap.Pixel(config.offset[0], config.offset[1]) : undefined,
+    anchor: config.anchor as any,
+    content: config.content,
+  });
+
+  marker._data = data;
+  marker._id = id;
+  return marker;
+}
+```
+
+### 6.2 LINESTRING 转 Polyline
+
+```ts
+const lineMatch = wkt.match(/LINESTRING\s*\(([^)]+)\)/i);
+if (lineMatch) {
+  const coords = lineMatch[1].split(',').map((coord) => {
+    const [lng, lat] = coord.trim().split(/\s+/);
+    return [parseFloat(lng), parseFloat(lat)];
+  });
+
+  const polyline = new AMap.Polyline({
+    path: coords,
+    strokeColor: polylineConfig.strokeColor || '#1890ff',
+    strokeWeight: polylineConfig.strokeWeight || 6,
+    strokeOpacity: polylineConfig.strokeOpacity || 1,
+    borderWeight: polylineConfig.borderWeight || 2,
+    isOutline: polylineConfig.isOutline || true,
+    outlineColor: polylineConfig.outlineColor || '#808080',
+    lineCap: polylineConfig.lineCap || 'round',
+    lineJoin: polylineConfig.lineJoin || 'round',
+    zIndex: polylineConfig.zIndex || 100,
+  });
+
+  return polyline;
+}
+```
+`Polyline` 是高德 AMap SDK 里的一个**覆盖物类**，用来在地图上画**折线（多段线）**。
+
+## 一句话解释
+
+它就是 `AMap.Polyline`：把一串经纬度点 `[[lng1, lat1], [lng2, lat2], ...]` 在地图上连成一条线。在我们这个项目里，它对应的是**车辆走过的或要走的路线轨迹**。
+
+## 在代码里的位置
+
+### 1) AMap 原生 SDK 提供的类
+
+`new AMap.Polyline(...)` 是高德地图 JSAPI 的标准 API，加载完 SDK 后挂在 `window.AMap` 上。`useMapInitialize.ts` 里：
+
+```ts
+AMapLoader.load({ key, version }).then((AMap) => {
+  (window as any).AMap = AMap;  // 这之后 AMap.Polyline 才可用
+  ...
+});
+```
+
+### 2) 适配层把 WKT 转成 `AMap.Polyline`
+
+`src/vendors/alife-yz-map-next/index.ts`，`wktToOverlay` 里 `LINESTRING` 分支会 `new AMap.Polyline({...})`。
+
+### 3) 业务层只传 WKT 字符串
+
+`DeliveryMap/index.tsx` 里 routes 数组：
+
+```ts
+routes
+  .filter((o) => Boolean(o?.path))
+  .map((route, index) => {
+    return wktToOverlay(
+      route.path,                                   // "LINESTRING(lng1 lat1,lng2 lat2,...)"
+      route.subRecordId || `route-line-${route.status}-${index}`,
+      route,
+      `route-line-${route.status}`                  // 样式 key
+    );
+  });
+```
+
+业务页面拼好 `route.path = "LINESTRING(...)"` 之后，地图组件统一交给 `wktToOverlay` 解析，生成一个 `AMap.Polyline` 实例，再 `$map.add(polyline)` 加到地图上。
+
+### 4) 样式从哪里来
+
+`DeliveryMap/utils.tsx` 的 `addOverlayConfig` 用 `Polyline.config.addConfig('route-line-${RouteStatus}', {...})` 把不同状态的折线样式提前注册：
+
+- `RouteStatus.Passed = 1` 灰色：已行驶历史路径  
+- `RouteStatus.NotPassed_POST = 0` 蓝色：未行驶派送路线  
+- `RouteStatus.NotPassed_PICK = 2` 绿色：未行驶揽收路线
+
+`wktToOverlay` 内部根据传入的 `type` 去查这份配置，把 `strokeColor / outlineColor / strokeWeight / zIndex` 等参数喂给 `new AMap.Polyline`。
+
+## Marker 和 Polyline 的对应关系
+
+地图上一共两类几何覆盖物，正好对应 WKT 的两种类型：
+
+| WKT 类型 | AMap 类 | 在我们项目里画什么 |
+|----------|---------|---------------------|
+| `POINT(lng lat)` | `AMap.Marker` | 车辆图标、站点编号、起点 / 终点 |
+| `LINESTRING(lng lat,lng lat,...)` | `AMap.Polyline` | 规划路线、历史已行驶路线 |
+
+所以面试讲“WKT → 覆盖物”时可以这么收口：`POINT` 走 `Marker` 分支负责站点和车辆点位，`LINESTRING` 走 `Polyline` 分支负责路线轨迹，加上前面的样式注册和 zIndex 分层，就组合出了地图上看到的“车 + 站点 + 路线”这套画面。
