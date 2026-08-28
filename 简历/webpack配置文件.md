@@ -15,7 +15,7 @@
     同时结合 devServer 提升开发体验。
     
 
-![[Pasted image 20260120213052.png]]
+![Pasted image 20260120213052](../assets/images/Pasted%20image%2020260120213052.png)
 
 
 

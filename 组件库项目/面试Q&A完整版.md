@@ -166,7 +166,7 @@ export default defineConfig({
 ### Q4: 你在实现比如 Upload 或 Input 这类复杂组件时，遇到过哪些难点？是怎么解决的？
 
 **回答要点：**
-![[Pasted image 20260122200524.png]]
+![Pasted image 20260122200524](../assets/images/Pasted%20image%2020260122200524.png)
 
 > "**Upload 组件的难点：**
 > 

@@ -13,7 +13,7 @@ console.log(input[1])//用console.log来输出
 然后我们点击enter 
 就会输出结果
 
-![[Pasted image 20260305221447.png]]
+![Pasted image 20260305221447](../assets/images/Pasted%20image%2020260305221447.png)
 
 
 split(/\s+/) 一次性把所有数字拆成 **数组**

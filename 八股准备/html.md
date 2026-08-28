@@ -18,6 +18,6 @@
 ```
 
 
-![[Pasted image 20251022192853.png]]
+![Pasted image 20251022192853](../assets/images/Pasted%20image%2020251022192853.png)
 
 `margin` 是 **外边距（margin）**，控制元素与元素之间的间距
